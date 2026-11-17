@@ -8,6 +8,7 @@ import {
     detectOptionalFaceFromDataUrl,
     extractFaceFromDataUrl,
     getTesselationTriangles,
+    resetImageLandmarker,
 } from "../vision/mediapipe_runner.js";
 import { MotionDriver } from "../vision/motion_driver.js";
 
@@ -564,6 +565,7 @@ export class FaceViewport {
         this.turntablePlaying = false;
         this.turntableCursor = 0;
         this.clearMotionClip();
+        resetImageLandmarker();
 
         this.refUrls = { front: null, three_quarter: null, side: null };
         this.extractedViews = { front: null, three_quarter: null, side: null };

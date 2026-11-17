@@ -35,6 +35,7 @@ const LOWER_LIP_SET = new Set([
 ]);
 
 const CORNER_LIP_SET = new Set([61, 78, 291, 308]);
+const LIP_VERTEX_SET = new Set([...UPPER_LIP_SET, ...LOWER_LIP_SET, ...CORNER_LIP_SET]);
 
 const BROW_SET = new Set([
     46, 53, 52, 65, 55, 70, 63, 105, 66, 107,
@@ -176,12 +177,132 @@ function buildEyeRig(pos, upperIds, upperFoldIds, lowerIds, outerIdx, innerIdx) 
     return { upperWeights, lowerWeights, lidGap, isLidMask };
 }
 
+/**
+ * Precompute Graph-Laplacian-diffused lip shaping fields for rounded "O" (mouthFunnel)
+ * and kissing pucker (mouthPucker) expressions without hard boundary seams.
+ */
+function buildLipRoundRig(pos, neighbors) {
+    const n = Math.floor(pos.length / 3);
+    const mouthCenterX = n > 291 ? 0.5 * (pos[61 * 3] + pos[291 * 3]) : 0;
+    const mouthCenterY = n > 14 ? 0.5 * (pos[13 * 3 + 1] + pos[14 * 3 + 1]) : 0;
+    const mouthHalfW = n > 291 ? Math.max(0.5 * Math.abs(pos[291 * 3] - pos[61 * 3]), 0.03) : 0.05;
+
+    const inwardX = new Float32Array(n);
+    const archY = new Float32Array(n);
+    const protrudeZ = new Float32Array(n);
+    const locked = new Uint8Array(n);
+
+    for (let i = 0; i < n; i++) {
+        if (NOSE_BONE_INDICES.has(i)) {
+            locked[i] = 1;
+            continue;
+        }
+        if (!LIP_VERTEX_SET.has(i)) continue;
+        locked[i] = 2;
+
+        const relX = (pos[i * 3] - mouthCenterX) / mouthHalfW;
+        const u = Math.min(1.0, Math.abs(relX));
+        // Pull outer corners strongly inward while keeping midline x=0 anchored
+        inwardX[i] = -Math.sign(relX || 0) * Math.pow(u, 0.9);
+        protrudeZ[i] = Math.cos(0.32 * Math.PI * u);
+
+        // Arch lip shoulders (~u = 0.4..0.85) into a smooth circle on mouthFunnel
+        const shoulder = Math.sin(Math.PI * Math.min(u, 0.96)) * (0.45 + 0.55 * u);
+        if (UPPER_LIP_SET.has(i)) {
+            archY[i] = shoulder;
+        } else if (LOWER_LIP_SET.has(i)) {
+            archY[i] = -shoulder;
+        } else {
+            // Pull extreme corners gently toward vertical mouth center
+            archY[i] = -Math.max(-0.5, Math.min(0.5, (pos[i * 3 + 1] - mouthCenterY) / mouthHalfW));
+        }
+    }
+
+    const diffuseField = (arr) => {
+        const nxt = new Float32Array(n);
+        // 5 seeded diffusion passes to spread influence into perioral cheeks/chin
+        for (let iter = 0; iter < 5; iter++) {
+            for (let i = 0; i < n; i++) {
+                if (locked[i] === 1) {
+                    nxt[i] = 0;
+                    continue;
+                }
+                if (locked[i] === 2) {
+                    nxt[i] = arr[i];
+                    continue;
+                }
+                const nbrs = neighbors[i];
+                if (!nbrs.length) {
+                    nxt[i] = arr[i];
+                    continue;
+                }
+                let sum = 0;
+                for (let k = 0; k < nbrs.length; k++) sum += arr[nbrs[k]];
+                nxt[i] = 0.30 * arr[i] + 0.70 * (sum / nbrs.length);
+            }
+            arr.set(nxt);
+        }
+        // 2 unpinned fairing passes eliminate any velocity step at the outer lip vermilion border
+        for (let iter = 0; iter < 2; iter++) {
+            for (let i = 0; i < n; i++) {
+                if (locked[i] === 1) {
+                    nxt[i] = 0;
+                    continue;
+                }
+                const nbrs = neighbors[i];
+                if (!nbrs.length) {
+                    nxt[i] = arr[i];
+                    continue;
+                }
+                let sum = 0;
+                for (let k = 0; k < nbrs.length; k++) sum += arr[nbrs[k]];
+                nxt[i] = 0.68 * arr[i] + 0.32 * (sum / nbrs.length);
+            }
+            arr.set(nxt);
+        }
+    };
+
+    diffuseField(inwardX);
+    diffuseField(archY);
+    diffuseField(protrudeZ);
+
+    return { mouthCenterX, mouthHalfW, inwardX, archY, protrudeZ };
+}
+
 export class FaceRetargetRig {
     constructor(restPositions, indices = [], initialWeights = null) {
-        this.rest = new Float32Array(restPositions);
         this.n = Math.floor(restPositions.length / 3);
-        this.symMap = buildSymmetryMap(this.rest);
         this.neighbors = buildAdjacency(this.n, indices);
+        this.rest = new Float32Array(restPositions);
+        this.symMap = buildSymmetryMap(this.rest);
+
+        this.regionWeights = {
+            eyes: 1.15,
+            brows: 1.0,
+            mouth: 1.0,
+            mouthWidth: 0.55,
+            jaw: 0.85,
+            cheeks: 0.45,
+        };
+        if (initialWeights) {
+            this.regionWeights = { ...this.regionWeights, ...initialWeights };
+        }
+        this.retargWeights = new Float32Array(this.n);
+        this.retargWeightsX = new Float32Array(this.n);
+        this.isOuterCheek = new Uint8Array(this.n);
+        this._tempDx = new Float32Array(this.n);
+        this._tempDy = new Float32Array(this.n);
+        this._tempDz = new Float32Array(this.n);
+
+        this.updateRestPositions(restPositions);
+    }
+
+    /**
+     * Refresh rest metrics, eyelid bounds, lip rounding fields, and diffused region weights
+     * when Sculpt sliders change without re-running the O(N^2) symmetry search.
+     */
+    updateRestPositions(restPositions) {
+        this.rest.set(restPositions);
 
         const eyeL = midPt(this.rest, LEFT_EYE_OUTER_IDX, LEFT_EYE_INNER_IDX);
         const eyeR = midPt(this.rest, RIGHT_EYE_OUTER_IDX, RIGHT_EYE_INNER_IDX);
@@ -196,6 +317,7 @@ export class FaceRetargetRig {
 
         this.eyeRight = buildEyeRig(this.rest, RIGHT_UPPER_LID, RIGHT_UPPER_FOLD, RIGHT_LOWER_LID, 33, 133);
         this.eyeLeft = buildEyeRig(this.rest, LEFT_UPPER_LID, LEFT_UPPER_FOLD, LEFT_LOWER_LID, 263, 362);
+        this.lipRound = buildLipRoundRig(this.rest, this.neighbors);
 
         this.eyeLineY = 0.5 * (eyeL[1] + eyeR[1]);
         this.maxAbsX = 1e-4;
@@ -207,21 +329,7 @@ export class FaceRetargetRig {
             if (y > this.maxY) this.maxY = y;
         }
 
-        this.regionWeights = {
-            eyes: 1.15,
-            brows: 1.0,
-            mouth: 1.0,
-            mouthWidth: 0.55,
-            jaw: 0.85,
-            cheeks: 0.45,
-        };
-        this.retargWeights = new Float32Array(this.n);
-        this.mouthWidthWeights = new Float32Array(this.n);
-        this.isOuterCheek = new Uint8Array(this.n);
-        this._tempDx = new Float32Array(this.n);
-        this._tempDy = new Float32Array(this.n);
-        this._tempDz = new Float32Array(this.n);
-
+        this.isOuterCheek.fill(0);
         for (let i = 0; i < this.n; i++) {
             const normX = Math.abs(this.rest[i * 3]) / this.maxAbsX;
             const vy = this.rest[i * 3 + 1];
@@ -230,7 +338,7 @@ export class FaceRetargetRig {
             }
         }
 
-        this.setRegionWeights(initialWeights || this.regionWeights);
+        this.setRegionWeights(this.regionWeights);
     }
 
     /**
@@ -240,9 +348,14 @@ export class FaceRetargetRig {
     setRegionWeights(weights) {
         this.regionWeights = { ...this.regionWeights, ...weights };
         const { eyes, brows, mouth, jaw, cheeks } = this.regionWeights;
+        const mw = Math.max(0.0, Math.min(1.5, this.regionWeights.mouthWidth ?? 0.55));
+        const mouthX = mouth * mw;
+        const jawX = jaw * Math.min(1.0, 0.45 + 0.55 * mw);
 
         const cur = new Float32Array(this.n);
+        const curX = new Float32Array(this.n);
         const nxt = new Float32Array(this.n);
+        const nxtX = new Float32Array(this.n);
         const seedKind = new Uint8Array(this.n); // 0=free, 1=locked(0), 2=region seed
 
         const browLineY = this.eyeLineY + (this.maxY - this.eyeLineY) * 0.28;
@@ -254,82 +367,70 @@ export class FaceRetargetRig {
 
             if (NOSE_BONE_INDICES.has(i)) {
                 cur[i] = 0.08 * cheeks;
+                curX[i] = 0.08 * cheeks;
                 seedKind[i] = 1;
             } else if ((vy > this.eyeLineY - 0.04 && normX > 0.80) || vy > this.maxY * 0.90) {
                 cur[i] = 0.0;
+                curX[i] = 0.0;
                 seedKind[i] = 1;
             } else if (this.eyeRight.isLidMask[i] || this.eyeLeft.isLidMask[i]) {
                 cur[i] = eyes;
+                curX[i] = eyes;
                 seedKind[i] = 2;
             } else if (BROW_SET.has(i)) {
                 cur[i] = brows;
+                curX[i] = brows;
                 seedKind[i] = 2;
             } else if (UPPER_LIP_SET.has(i) || LOWER_LIP_SET.has(i) || CORNER_LIP_SET.has(i)) {
                 cur[i] = mouth;
+                curX[i] = mouthX;
                 seedKind[i] = 2;
             } else if (JAW_SET.has(i)) {
                 cur[i] = jaw;
+                curX[i] = jawX;
                 seedKind[i] = 2;
             } else if (vy > browLineY) {
                 cur[i] = brows * 0.35;
+                curX[i] = brows * 0.35;
             } else {
                 cur[i] = cheeks;
+                curX[i] = cheeks;
             }
         }
 
-        // 6 Laplacian diffusion passes across triangle edges blend intermediate zones smoothly
-        for (let iter = 0; iter < 6; iter++) {
+        // 8 Laplacian diffusion passes across triangle edges keep both Y/Z and X fields strictly harmonic
+        for (let iter = 0; iter < 8; iter++) {
             for (let i = 0; i < this.n; i++) {
                 if (seedKind[i] === 1) {
                     nxt[i] = cur[i];
+                    nxtX[i] = curX[i];
                     continue;
                 }
                 const nbrs = this.neighbors[i];
                 if (!nbrs.length) {
                     nxt[i] = cur[i];
+                    nxtX[i] = curX[i];
                     continue;
                 }
                 let sum = 0;
-                for (let k = 0; k < nbrs.length; k++) sum += cur[nbrs[k]];
-                const avg = sum / nbrs.length;
-                // Keep direct region seeds anchored lightly on early passes, diffuse free vertices fully
-                const selfKeep = seedKind[i] === 2 ? 0.72 : 0.35;
-                nxt[i] = selfKeep * cur[i] + (1.0 - selfKeep) * avg;
+                let sumX = 0;
+                for (let k = 0; k < nbrs.length; k++) {
+                    const nb = nbrs[k];
+                    sum += cur[nb];
+                    sumX += curX[nb];
+                }
+                const inv = 1.0 / nbrs.length;
+                const selfKeep = seedKind[i] === 2 ? 0.65 : 0.30;
+                const nbrKeep = 1.0 - selfKeep;
+                nxt[i] = selfKeep * cur[i] + nbrKeep * (sum * inv);
+                nxtX[i] = selfKeep * curX[i] + nbrKeep * (sumX * inv);
             }
             cur.set(nxt);
+            curX.set(nxtX);
         }
 
         this.retargWeights.set(cur);
-
-        // Build diffused horizontal mouth-width multiplier (mouthWidth at lips/corners -> 1.0 outside)
-        const mw = Math.max(0.0, Math.min(1.5, this.regionWeights.mouthWidth ?? 0.55));
-        const mwCur = new Float32Array(this.n).fill(1.0);
-        const mwNxt = new Float32Array(this.n);
-        const isLip = new Uint8Array(this.n);
-        for (let i = 0; i < this.n; i++) {
-            if (UPPER_LIP_SET.has(i) || LOWER_LIP_SET.has(i) || CORNER_LIP_SET.has(i)) {
-                mwCur[i] = mw;
-                isLip[i] = 1;
-            }
-        }
-        for (let iter = 0; iter < 4; iter++) {
-            for (let i = 0; i < this.n; i++) {
-                if (isLip[i]) {
-                    mwNxt[i] = mw;
-                    continue;
-                }
-                const nbrs = this.neighbors[i];
-                if (!nbrs.length) {
-                    mwNxt[i] = mwCur[i];
-                    continue;
-                }
-                let sum = 0;
-                for (let k = 0; k < nbrs.length; k++) sum += mwCur[nbrs[k]];
-                mwNxt[i] = 0.4 * mwCur[i] + 0.6 * (sum / nbrs.length);
-            }
-            mwCur.set(mwNxt);
-        }
-        this.mouthWidthWeights.set(mwCur);
+        this.retargWeightsX.set(curX);
     }
 
     evaluate(motionFrame, outArray) {
@@ -341,12 +442,30 @@ export class FaceRetargetRig {
         // Damp outer cheek lateral foreshortening when head is turned strongly sideways
         const angleDamp = 1.0 - 0.65 * smoothstep(0.24, 0.72, poseAngleMag);
 
+        let centeredGate = 1.0;
+
         if (deltas && deltas.length >= this.n * 3) {
             const scaleX = this.charEyeSpan;
             const charAspect = this.charChinDrop / this.charEyeSpan;
             const scaleY = this.charEyeSpan * (charAspect / Math.max(neutralAspect || charAspect, 0.6));
             const scaleZ = this.charEyeSpan * 0.32;
             const maxStep = this.charChinDrop * 0.78;
+
+            // Separate whole-mouth sideways translation from symmetric inward corner pinch ("O"/pucker)
+            const sgn = mirror ? -1.0 : 1.0;
+            const idxL = mirror ? this.symMap[61] : 61;
+            const idxR = mirror ? this.symMap[291] : 291;
+            const idxU = mirror ? this.symMap[0] : 0;
+            const idxD = mirror ? this.symMap[17] : 17;
+            const dxL = sgn * deltas[idxL * 3];
+            const dxR = sgn * deltas[idxR * 3];
+            const dxU = sgn * deltas[idxU * 3];
+            const dxD = sgn * deltas[idxD * 3];
+
+            const mouthShiftX = 0.25 * (dxL + dxR + dxU + dxD);
+            const cornerPinch = dxL - dxR; // > 0 when both corners pull inward toward midline
+            centeredGate = 1.0 - smoothstep(0.018, 0.050, Math.abs(mouthShiftX));
+            const pinchBoost = centeredGate * smoothstep(0.005, 0.045, cornerPinch);
 
             for (let i = 0; i < this.n; i++) {
                 if (this.eyeRight.isLidMask[i] || this.eyeLeft.isLidMask[i]) {
@@ -366,9 +485,9 @@ export class FaceRetargetRig {
                 const srcIdx = mirror ? this.symMap[i] : i;
                 const sOff = srcIdx * 3;
                 const cAtten = this.isOuterCheek[i] ? angleDamp : 1.0;
-                const xScale = this.mouthWidthWeights[i];
+                const wx = this.retargWeightsX[i] + pinchBoost * (w - this.retargWeightsX[i]);
 
-                const dx = Math.max(-maxStep, Math.min(maxStep, (mirror ? -deltas[sOff] : deltas[sOff]) * scaleX * w * cAtten * xScale));
+                const dx = Math.max(-maxStep, Math.min(maxStep, (mirror ? -deltas[sOff] : deltas[sOff]) * scaleX * wx * cAtten));
                 const dy = Math.max(-maxStep, Math.min(maxStep, deltas[sOff + 1] * scaleY * w));
                 const dz = Math.max(-0.04, Math.min(0.04, deltas[sOff + 2] * scaleZ * w * cAtten));
 
@@ -400,6 +519,28 @@ export class FaceRetargetRig {
                     outArray[dOff] += this._tempDx[i];
                     outArray[dOff + 1] += this._tempDy[i];
                     outArray[dOff + 2] += this._tempDz[i];
+                }
+            }
+        }
+
+        // Apply centered mouthFunnel ("O" rounding) & mouthPucker (kiss protrusion), gated off during side-shifts
+        if (bs && this.lipRound && centeredGate > 0.01) {
+            const mouthScale = Math.max(0.0, Math.min(1.65, this.regionWeights.mouth)) * centeredGate;
+            const funnel = Math.max(0.0, Math.min(1.0, bs.mouthFunnel || 0));
+            const pucker = Math.max(0.0, Math.min(1.0, bs.mouthPucker || 0));
+            const roundStrength = Math.min(0.95, funnel * 0.75 + pucker * 0.85) * mouthScale;
+
+            if (roundStrength > 0.01) {
+                const { mouthHalfW, inwardX, archY, protrudeZ } = this.lipRound;
+                const xAmp = mouthHalfW * 0.34 * roundStrength;
+                const yAmp = mouthHalfW * 0.16 * funnel * mouthScale;
+                const zAmp = this.charEyeSpan * (0.028 * pucker + 0.018 * funnel) * mouthScale;
+
+                for (let i = 0; i < this.n; i++) {
+                    const o = i * 3;
+                    outArray[o] += inwardX[i] * xAmp;
+                    outArray[o + 1] += archY[i] * yAmp;
+                    outArray[o + 2] += protrudeZ[i] * zAmp;
                 }
             }
         }

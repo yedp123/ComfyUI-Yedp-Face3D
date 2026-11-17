@@ -165,7 +165,11 @@ export class ReconstructedFaceMesh {
         this.sculptState = { ...sculptState };
         if (!this.hasMesh || !this.sculptRig) return;
         this.restPositions = this.sculptRig.evaluate(this.sculptState);
-        this.morphRig = new FaceRetargetRig(this.restPositions, this.baseIndices, this.regionWeights);
+        if (this.morphRig) {
+            this.morphRig.updateRestPositions(this.restPositions);
+        } else {
+            this.morphRig = new FaceRetargetRig(this.restPositions, this.baseIndices, this.regionWeights);
+        }
         if (this.lastMotionFrame) {
             this.applyMotionFrame(this.lastMotionFrame);
         } else {
