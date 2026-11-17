@@ -20,6 +20,8 @@ export function createViewportDOM(handlers) {
         onLightsChange,
         onWeightsChange,
         onSculptChange,
+        onRenderChange,
+        onFitHead,
         onSelectRefFile,
         onRemoveRefView,
         onResetAll,
@@ -193,7 +195,7 @@ export function createViewportDOM(handlers) {
     const lightPanel = createLightPanel(onLightsChange);
     const webcamOverlay = createWebcamOverlay();
     const mocapPanel = createMocapPanel(webcamOverlay);
-    const renderPanel = createRenderPanel();
+    const renderPanel = createRenderPanel(onRenderChange, onFitHead);
 
     const rightSidebar = createRightSidebar([
         { id: "sculpt", title: "SCULPT", icon: "sculpt", body: sculptPanel.panel },

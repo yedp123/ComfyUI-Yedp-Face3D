@@ -1,4 +1,6 @@
 from pathlib import Path
+import struct
+import threading
 from typing import Iterable
 import uuid
 
@@ -11,6 +13,10 @@ _REGISTERED_EXTENSIONS: set[str] = set()
 _DRIVING_BATCH_CACHE: dict[str, list[str]] = {}
 _MAX_CACHED_BATCHES = 4
 
+_RENDER_JOBS_LOCK = threading.Lock()
+_RENDER_JOBS: dict[str, dict] = {}
+_MAX_RENDER_JOBS = 8
+
 
 def cache_driving_batch(frames: list[str]) -> str:
     """Store encoded driving video frames in memory and return a short batch ID."""
@@ -22,8 +28,33 @@ def cache_driving_batch(frames: list[str]) -> str:
     return batch_id
 
 
+def create_render_job(width: int, height: int) -> tuple[str, dict]:
+    """Allocate a thread-safe pending render job entry for browser-to-Python pass streaming."""
+    job_id = uuid.uuid4().hex[:16]
+    job = {
+        "event": threading.Event(),
+        "width": int(width),
+        "height": int(height),
+        "frames": {},
+        "metadata": None,
+        "error": None,
+    }
+    with _RENDER_JOBS_LOCK:
+        if len(_RENDER_JOBS) >= _MAX_RENDER_JOBS:
+            oldest_id = next(iter(_RENDER_JOBS))
+            _RENDER_JOBS.pop(oldest_id, None)
+        _RENDER_JOBS[job_id] = job
+    return job_id, job
+
+
+def pop_render_job(job_id: str) -> dict | None:
+    """Remove and return a render job entry once completed or expired."""
+    with _RENDER_JOBS_LOCK:
+        return _RENDER_JOBS.pop(job_id, None)
+
+
 def register_static_routes(package_dir: Path) -> None:
-    """Expose js/, models/, and Face3D API endpoints on PromptServer."""
+    """Expose js/, models/, assets/, and Face3D API endpoints on PromptServer."""
     prompt_server = getattr(PromptServer, "instance", None)
     if prompt_server is None:
         return
@@ -76,5 +107,71 @@ def register_static_routes(package_dir: Path) -> None:
         if frames is None:
             return web.json_response({"error": "Driving batch not found or expired."}, status=404)
         return web.json_response({"batch_id": batch_id, "frames": frames})
+
+    @prompt_server.routes.post("/yedp_face3d/render_chunk/{job_id}")
+    async def handle_render_chunk(request: web.Request) -> web.Response:
+        job_id = request.match_info.get("job_id", "")
+        with _RENDER_JOBS_LOCK:
+            job = _RENDER_JOBS.get(job_id)
+        if job is None:
+            return web.json_response({"error": "Render job not found or expired."}, status=404)
+
+        body = await request.read()
+        if len(body) < 16:
+            return web.json_response({"error": "Truncated render chunk header."}, status=400)
+
+        start_frame, frame_count, width, height = struct.unpack("<4I", body[:16])
+        if width != job["width"] or height != job["height"] or frame_count == 0:
+            return web.json_response({"error": "Render chunk dimensions mismatch job."}, status=400)
+
+        frame_stride = width * height * 11
+        expected_len = 16 + frame_count * frame_stride
+        if len(body) != expected_len:
+            return web.json_response(
+                {"error": f"Expected {expected_len} bytes, received {len(body)}."},
+                status=400,
+            )
+
+        mv = memoryview(body)
+        with _RENDER_JOBS_LOCK:
+            for k in range(frame_count):
+                off = 16 + k * frame_stride
+                job["frames"][start_frame + k] = bytes(mv[off : off + frame_stride])
+
+        return web.json_response({"ok": True, "received": frame_count})
+
+    @prompt_server.routes.post("/yedp_face3d/render_finish/{job_id}")
+    async def handle_render_finish(request: web.Request) -> web.Response:
+        job_id = request.match_info.get("job_id", "")
+        with _RENDER_JOBS_LOCK:
+            job = _RENDER_JOBS.get(job_id)
+        if job is None:
+            return web.json_response({"error": "Render job not found or expired."}, status=404)
+
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+
+        job["metadata"] = payload.get("metadata", {})
+        job["event"].set()
+        return web.json_response({"ok": True})
+
+    @prompt_server.routes.post("/yedp_face3d/render_error/{job_id}")
+    async def handle_render_error(request: web.Request) -> web.Response:
+        job_id = request.match_info.get("job_id", "")
+        with _RENDER_JOBS_LOCK:
+            job = _RENDER_JOBS.get(job_id)
+        if job is None:
+            return web.json_response({"ok": False}, status=404)
+
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+
+        job["error"] = str(payload.get("error") or "Browser render error.")
+        job["event"].set()
+        return web.json_response({"ok": True})
 
     _REGISTERED_EXTENSIONS.add(extension_name)

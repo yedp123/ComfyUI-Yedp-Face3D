@@ -28,6 +28,9 @@ const FRAGMENT_SHADER = /* glsl */ `
     uniform int uViewMode;
     uniform float uDepthNear;
     uniform float uDepthFar;
+    uniform float uDepthInvert;
+    uniform vec3 uNormalFlip;
+    uniform float uAlphaMode;
 
     uniform vec3 uKeyDir;
     uniform vec3 uKeyColor;
@@ -37,6 +40,10 @@ const FRAGMENT_SHADER = /* glsl */ `
     uniform float uRimIntensity;
     uniform float uAmbientIntensity;
 
+    uniform vec3 uClayKeyDir;
+    uniform float uClayKeyIntensity;
+    uniform float uClayFillIntensity;
+
     varying vec2 vUv;
     varying float vFaceMask;
     varying vec3 vWorldNormal;
@@ -44,25 +51,39 @@ const FRAGMENT_SHADER = /* glsl */ `
     varying float vViewDepth;
 
     void main() {
+        float maskFactor = smoothstep(0.0, 0.85, vFaceMask);
+        float outAlpha = uAlphaMode > 0.5 ? maskFactor : 1.0;
+
         if (uViewMode == 1) {
-            // Camera-space ControlNet RGB surface normals
-            vec3 nView = normalize(vViewNormal);
-            gl_FragColor = vec4(nView * 0.5 + 0.5, 1.0);
+            // Pure unlit camera-space ControlNet RGB surface normals
+            vec3 nView = normalize(vViewNormal) * uNormalFlip;
+            gl_FragColor = vec4(nView * 0.5 + 0.5, outAlpha);
             return;
         }
 
         if (uViewMode == 2) {
-            // Tight-normalized Z-depth (1.0 = closest nose tip, 0.15 = back of head/ears)
+            // Linear Z-depth mapped across [0.05..1.0] so foreground stays separate from 0.0 black bg
             float span = max(uDepthFar - uDepthNear, 0.001);
             float d = 1.0 - clamp((vViewDepth - uDepthNear) / span, 0.0, 1.0);
-            float mapped = mix(0.15, 1.0, d);
-            gl_FragColor = vec4(vec3(mapped), 1.0);
+            if (uDepthInvert > 0.5) d = 1.0 - d;
+            gl_FragColor = vec4(vec3(mix(0.05, 1.0, d)), outAlpha);
+            return;
+        }
+
+        if (uViewMode == 3) {
+            // Neutral gray Clay shaded render (soft key + hemisphere fill)
+            vec3 nClay = normalize(vWorldNormal);
+            float clayDiff = max(dot(nClay, normalize(uClayKeyDir)), 0.0);
+            float clayHemi = 0.5 + 0.5 * nClay.y;
+            vec3 clayColor = vec3(0.66) * (uClayFillIntensity * (0.7 + 0.3 * clayHemi) + clayDiff * uClayKeyIntensity);
+            gl_FragColor = vec4(clamp(clayColor, 0.0, 1.0), outAlpha);
+            #include <colorspace_fragment>
             return;
         }
 
         vec3 texAlbedo = texture2D(uFrontTex, vUv).rgb;
         vec3 albedo = uHasHeadShell > 0.5
-            ? mix(uSkinColor, texAlbedo, smoothstep(0.0, 0.85, vFaceMask))
+            ? mix(uSkinColor, texAlbedo, maskFactor)
             : texAlbedo;
         vec3 n = normalize(vWorldNormal);
         float keyDiff = max(dot(n, normalize(uKeyDir)), 0.0);
@@ -73,7 +94,7 @@ const FRAGMENT_SHADER = /* glsl */ `
             + uKeyColor * (keyDiff * uKeyIntensity)
             + uRimColor * (rimDiff * uRimIntensity);
 
-        gl_FragColor = vec4(albedo * lighting, 1.0);
+        gl_FragColor = vec4(albedo * lighting, outAlpha);
         #include <colorspace_fragment>
     }
 `;
@@ -90,11 +111,13 @@ const GUIDE_DEPTH_VERTEX = /* glsl */ `
 const GUIDE_DEPTH_FRAGMENT = /* glsl */ `
     uniform float uDepthNear;
     uniform float uDepthFar;
+    uniform float uDepthInvert;
     varying float vViewDepth;
     void main() {
         float span = max(uDepthFar - uDepthNear, 0.001);
         float d = 1.0 - clamp((vViewDepth - uDepthNear) / span, 0.0, 1.0);
-        gl_FragColor = vec4(vec3(mix(0.15, 1.0, d)), 1.0);
+        if (uDepthInvert > 0.5) d = 1.0 - d;
+        gl_FragColor = vec4(vec3(mix(0.05, 1.0, d)), 1.0);
     }
 `;
 
@@ -111,6 +134,7 @@ export function createFaceMaterial(fallbackTex) {
         vertexShader: VERTEX_SHADER,
         fragmentShader: FRAGMENT_SHADER,
         side: THREE.DoubleSide,
+        blending: THREE.NoBlending,
         uniforms: {
             uFrontTex: { value: fallbackTex },
             uSkinColor: { value: new THREE.Color(0xd8b4a0).convertSRGBToLinear() },
@@ -118,6 +142,9 @@ export function createFaceMaterial(fallbackTex) {
             uViewMode: { value: 0 },
             uDepthNear: { value: 1.4 },
             uDepthFar: { value: 2.3 },
+            uDepthInvert: { value: 0.0 },
+            uNormalFlip: { value: new THREE.Vector3(1, 1, 1) },
+            uAlphaMode: { value: 0.0 },
             uKeyDir: { value: new THREE.Vector3(1.8, 1.6, 2.4).normalize() },
             uKeyColor: { value: new THREE.Color(0xfff5ea) },
             uKeyIntensity: { value: 0.72 },
@@ -125,6 +152,9 @@ export function createFaceMaterial(fallbackTex) {
             uRimColor: { value: new THREE.Color(0x7dd3fc) },
             uRimIntensity: { value: 0.35 },
             uAmbientIntensity: { value: 0.55 },
+            uClayKeyDir: { value: new THREE.Vector3(0.45, 0.58, 0.68).normalize() },
+            uClayKeyIntensity: { value: 0.85 },
+            uClayFillIntensity: { value: 0.35 },
         },
     });
 }
@@ -133,9 +163,11 @@ export function createGuideDepthMaterial() {
     return new THREE.ShaderMaterial({
         vertexShader: GUIDE_DEPTH_VERTEX,
         fragmentShader: GUIDE_DEPTH_FRAGMENT,
+        blending: THREE.NoBlending,
         uniforms: {
             uDepthNear: { value: 1.4 },
             uDepthFar: { value: 2.3 },
+            uDepthInvert: { value: 0.0 },
         },
     });
 }

@@ -3,6 +3,7 @@ import * as THREE from "../lib/three.module.js";
 import { OrbitControls } from "../lib/OrbitControls.js";
 import { createPlaceholderHead } from "./placeholder_head.js";
 import { ReconstructedFaceMesh } from "./face_mesh.js";
+import { renderAndUploadPasses } from "./offscreen_renderer.js";
 import {
     detectFaceForVideo,
     detectOptionalFaceFromDataUrl,
@@ -17,9 +18,9 @@ const DEFAULT_TARGET = [0, -0.02, 0];
 const MAX_RECORDED_FRAMES = 600;
 
 /**
- * Interactive Three.js viewport with multi-view face mesh, right-hand accordion
- * controls (Sculpt, Weights, Lights, Mocap, Render), view-mode switcher,
- * 180-deg turntable sweep, and live webcam / driving video mocap.
+ * Interactive Three.js viewport supporting Ortho/Persp cameras, Fit Head,
+ * multi-view face + welded head shell reconstruction, sculpting, mocap, and
+ * synchronized Phase 4 offscreen multi-pass rendering.
  */
 export class FaceViewport {
     constructor(ui) {
@@ -39,6 +40,7 @@ export class FaceViewport {
 
         this.refUrls = { front: null, three_quarter: null, side: null };
         this.extractedViews = { front: null, three_quarter: null, side: null };
+        this.lastPythonSyncedRefs = null;
         this.loadToken = 0;
         this.reconstructToken = 0;
 
@@ -53,12 +55,29 @@ export class FaceViewport {
         this.isRecording = false;
         this.lastWebcamDetectMs = 0;
         this.recordedClip = [];
+        this.clipSource = null;
         this.clipPlaying = false;
         this.clipCursor = 0;
 
         this.scene = new THREE.Scene();
-        this.camera = new THREE.PerspectiveCamera(36, 480 / 380, 0.05, 50);
-        this.camera.position.set(...DEFAULT_CAMERA_POS);
+        this.renderState = this.ui.renderPanel.getState();
+
+        const initAspect = 480 / 380;
+        this.perspCamera = new THREE.PerspectiveCamera(this.renderState.fov || 36, initAspect, 0.05, 50);
+        this.perspCamera.position.set(...DEFAULT_CAMERA_POS);
+
+        const initDist = new THREE.Vector3(...DEFAULT_CAMERA_POS).distanceTo(new THREE.Vector3(...DEFAULT_TARGET));
+        this.orthoHalfH = initDist * Math.tan(THREE.MathUtils.degToRad((this.renderState.fov || 36) * 0.5));
+        this.orthoCamera = new THREE.OrthographicCamera(
+            -this.orthoHalfH * initAspect,
+            this.orthoHalfH * initAspect,
+            this.orthoHalfH,
+            -this.orthoHalfH,
+            0.05,
+            50
+        );
+        this.orthoCamera.position.set(...DEFAULT_CAMERA_POS);
+        this.camera = this.renderState.projection === "ortho" ? this.orthoCamera : this.perspCamera;
 
         this.renderer = this.createRenderer(ui.canvas);
         if (!this.renderer) return;
@@ -66,8 +85,10 @@ export class FaceViewport {
         this.controls = new OrbitControls(this.camera, this.renderer.domElement);
         this.controls.enableDamping = true;
         this.controls.dampingFactor = 0.08;
-        this.controls.minDistance = 0.65;
+        this.controls.minDistance = 0.45;
         this.controls.maxDistance = 6.0;
+        this.controls.minZoom = 0.25;
+        this.controls.maxZoom = 8.0;
         this.controls.target.set(...DEFAULT_TARGET);
         this.controls.update();
 
@@ -80,6 +101,7 @@ export class FaceViewport {
         this.reconstructedFace.updateLights(this.ui.lightPanel.getState());
         this.reconstructedFace.setRegionWeights(this.ui.weightPanel.getState());
         this.reconstructedFace.setSculptState(this.ui.sculptPanel.getState());
+        this.reconstructedFace.applyRenderState(this.renderState);
         this.scene.add(this.placeholderHead.group, this.reconstructedFace.group);
 
         this.bindHudEvents();
@@ -209,6 +231,113 @@ export class FaceViewport {
         this.reconstructedFace?.setSculptState(sculptState);
     }
 
+    updateRenderSettings(state, changedKey = null) {
+        const prevProj = this.renderState?.projection || "ortho";
+        this.renderState = { ...state };
+        this.reconstructedFace?.applyRenderState(this.renderState);
+
+        if (changedKey === "fov") {
+            this.perspCamera.fov = Number(state.fov || 36);
+            this.perspCamera.updateProjectionMatrix();
+        } else if (changedKey === "elevation") {
+            const offset = this.camera.position.clone().sub(this.controls.target);
+            const r = Math.max(offset.length(), 0.45);
+            const az = Math.atan2(offset.x, offset.z);
+            const el = THREE.MathUtils.degToRad(state.elevation || 0);
+            this.camera.position.set(
+                this.controls.target.x + r * Math.cos(el) * Math.sin(az),
+                this.controls.target.y + r * Math.sin(el),
+                this.controls.target.z + r * Math.cos(el) * Math.cos(az)
+            );
+            this.controls.update();
+        } else if (changedKey === "projection" || changedKey === "reset") {
+            if (state.projection !== prevProj || changedKey === "reset") {
+                this.switchCameraProjection(state.projection);
+            }
+            if (changedKey === "reset") {
+                this.resetCamera();
+            }
+        }
+        if (changedKey === "exportMode" || changedKey === "reset") {
+            this.updateRenderUI();
+            this.updateReadout();
+        }
+    }
+
+    switchCameraProjection(projection) {
+        if (!this.controls) return;
+        const nextIsOrtho = projection === "ortho";
+        const oldCam = this.camera;
+        const newCam = nextIsOrtho ? this.orthoCamera : this.perspCamera;
+        if (oldCam === newCam) return;
+
+        const target = this.controls.target;
+        const offset = oldCam.position.clone().sub(target);
+        const dist = Math.max(offset.length(), 0.45);
+        const dir = dist > 1e-5 ? offset.normalize() : new THREE.Vector3(0, 0, 1);
+
+        if (nextIsOrtho) {
+            this.orthoHalfH = dist * Math.tan(THREE.MathUtils.degToRad((this.perspCamera.fov || 36) * 0.5));
+            this.orthoCamera.zoom = 1.0;
+            this.orthoCamera.position.copy(oldCam.position);
+        } else {
+            const visHalfH = this.orthoHalfH / Math.max(this.orthoCamera.zoom, 1e-4);
+            this.perspCamera.fov = Number(this.renderState.fov || 36);
+            const newDist = Math.max(visHalfH / Math.tan(THREE.MathUtils.degToRad(this.perspCamera.fov * 0.5)), 0.45);
+            this.perspCamera.position.copy(target).addScaledVector(dir, newDist);
+            this.perspCamera.updateProjectionMatrix();
+        }
+
+        this.camera = newCam;
+        this.controls.object = newCam;
+        this.applyResize(this.viewportWidth, this.viewportHeight);
+        this.controls.update();
+    }
+
+    fitHeadToView(stateOverride = null) {
+        if (!this.controls) return;
+        const rs = stateOverride || this.ui.renderPanel.getState();
+        this.renderState = { ...rs };
+
+        const box = this.reconstructedFace.hasMesh
+            ? this.reconstructedFace.getWorldBoundingBox()
+            : new THREE.Box3().setFromObject(this.placeholderHead.group);
+        if (box.isEmpty()) return;
+
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        const margin = 1.0 + Math.max(0.0, Number(rs.fitMargin ?? 0.12));
+        const outAspect = this.outputWidth / Math.max(this.outputHeight, 1);
+        const viewAspect = this.viewportWidth / Math.max(this.viewportHeight, 1);
+        const limitingAspect = Math.min(outAspect, viewAspect);
+        const reqHalfH = 0.5 * Math.max(size.y, size.x / Math.max(limitingAspect, 0.25)) * margin;
+        const elRad = THREE.MathUtils.degToRad(rs.elevation || 0);
+
+        this.controls.target.copy(center);
+        if (this.camera.isOrthographicCamera) {
+            this.orthoHalfH = reqHalfH;
+            this.orthoCamera.zoom = 1.0;
+            const dist = Math.max(size.length() * 2.5, 1.85);
+            this.orthoCamera.position.set(
+                center.x,
+                center.y + Math.sin(elRad) * dist,
+                center.z + Math.cos(elRad) * dist
+            );
+            this.applyResize(this.viewportWidth, this.viewportHeight);
+        } else {
+            this.perspCamera.fov = Number(rs.fov || 36);
+            const fovRad = THREE.MathUtils.degToRad(this.perspCamera.fov * 0.5);
+            const dist = Math.max(reqHalfH / Math.tan(fovRad), size.z * 0.8 + 0.6);
+            this.perspCamera.position.set(
+                center.x,
+                center.y + Math.sin(elRad) * dist,
+                center.z + Math.cos(elRad) * dist
+            );
+            this.perspCamera.updateProjectionMatrix();
+        }
+        this.controls.update();
+    }
+
     toggleTurntable() {
         if (this.turntablePlaying) {
             this.turntablePlaying = false;
@@ -277,9 +406,13 @@ export class FaceViewport {
         if (this.isRecording) {
             this.isRecording = false;
             this.updateMotionUI();
+            if (this.recordedClip.length > 0 && this.ui.renderPanel) {
+                this.ui.renderPanel.setState({ exportMode: "clip" }, true);
+            }
             return;
         }
         this.recordedClip = [];
+        this.clipSource = "webcam";
         this.motionDriver.calibrateNextFrame();
         this.isRecording = true;
         this.updateMotionUI();
@@ -305,9 +438,16 @@ export class FaceViewport {
         this.clipPlaying = false;
         this.isRecording = false;
         this.recordedClip = [];
+        this.clipSource = null;
         this.motionDriver.reset();
         this.reconstructedFace?.resetPose();
+        if (this.renderState?.exportMode === "clip" && this.ui.renderPanel) {
+            this.ui.renderPanel.setState({ exportMode: "turntable" }, false);
+            this.renderState = this.ui.renderPanel.getState();
+        }
         this.updateMotionUI();
+        this.updateRenderUI();
+        this.updateReadout();
     }
 
     updateMotionUI() {
@@ -341,11 +481,25 @@ export class FaceViewport {
         }
     }
 
+    getExportPlan() {
+        const mode = this.renderState?.exportMode || "turntable";
+        if (mode === "single") {
+            return { mode: "single", label: "Single", frames: 1 };
+        }
+        if (mode === "clip") {
+            const count = this.recordedClip.length;
+            return { mode: "clip", label: count > 0 ? "Clip" : "No Clip", frames: count };
+        }
+        return { mode: "turntable", label: "Turntable", frames: this.turntableFrames };
+    }
+
     updateRenderUI() {
         const rp = this.ui.renderPanel;
+        const plan = this.getExportPlan();
         rp.turntableBtn.style.borderColor = this.turntablePlaying ? "#38bdf8" : "rgba(255,255,255,0.16)";
         rp.turntableBtn.style.color = this.turntablePlaying ? "#38bdf8" : "#f8fafc";
-        rp.setOutputSpec(this.outputWidth, this.outputHeight, this.turntableFrames);
+        rp.turntableBtn.textContent = this.turntablePlaying ? "Stop Turntable" : "Play Turntable";
+        rp.setOutputSpec(this.outputWidth, this.outputHeight, plan.frames, plan.label);
         if (!this.turntablePlaying) {
             rp.renderStatus.textContent = "Idle · Ready to queue";
             rp.renderStatus.style.color = "#94a3b8";
@@ -363,6 +517,7 @@ export class FaceViewport {
 
     async loadSingleReference(viewKey, dataUrl) {
         const token = ++this.loadToken;
+        this.lastPythonSyncedRefs = null;
         this.refUrls[viewKey] = dataUrl;
         this.ui.refStack.setPreview(viewKey, dataUrl, false);
         this.setStatus(`Extracting ${viewKey} (CPU)...`);
@@ -461,12 +616,19 @@ export class FaceViewport {
             }
 
             if (clip.length > 0 && token === this.loadToken) {
+                const hadDriving = this.clipSource === "driving";
                 this.recordedClip = clip;
+                this.clipSource = "driving";
                 this.turntablePlaying = false;
                 this.clipCursor = 0;
                 this.clipPlaying = true;
+                if (!hadDriving && this.ui.renderPanel) {
+                    this.ui.renderPanel.setState({ exportMode: "clip" }, false);
+                    this.renderState = this.ui.renderPanel.getState();
+                }
                 this.updateMotionUI();
                 this.updateRenderUI();
+                this.updateReadout();
                 this.setStatus(`Driving Video Ready (${clip.length}f)`);
             }
         } catch (err) {
@@ -481,6 +643,7 @@ export class FaceViewport {
         const token = ++this.reconstructToken;
 
         try {
+            const hadMeshBefore = this.reconstructedFace.hasMesh;
             const triangles = await getTesselationTriangles();
             const response = await api.fetchApi("/yedp_face3d/reconstruct", {
                 method: "POST",
@@ -509,10 +672,15 @@ export class FaceViewport {
 
             this.reconstructedFace.setGuidesVisible(this.guidesVisible);
             this.reconstructedFace.setViewMode(this.viewMode);
+            this.reconstructedFace.applyRenderState(this.renderState);
 
             this.placeholderHead.group.visible = false;
             this.reconstructedFace.group.visible = true;
             this.updateRefButtonsUI();
+
+            if (!hadMeshBefore) {
+                this.fitHeadToView();
+            }
 
             const views = ["Front"];
             if (meshData.has_three_quarter) views.push("3/4 depth");
@@ -525,6 +693,101 @@ export class FaceViewport {
         }
     }
 
+    async executeRenderJob(detail) {
+        if (this.disposed || !detail?.job_id) return;
+        const {
+            job_id,
+            front = null,
+            three_quarter = null,
+            side = null,
+            depth_weight = null,
+            driving_batch_id = null,
+            driving_frame_count = 0,
+            render_width = this.outputWidth,
+            render_height = this.outputHeight,
+            turntable_frames = this.turntableFrames,
+            anatomical_guides = this.guidesVisible,
+        } = detail;
+
+        try {
+            this.setGuidesVisible(anatomical_guides);
+            this.setOutputResolution(render_width, render_height);
+            this.setTurntableFrames(turntable_frames);
+
+            if (!driving_batch_id && this.clipSource === "driving") {
+                this.clearMotionClip();
+            }
+
+            const exportMode = this.ui.renderPanel.getState().exportMode || "turntable";
+            const needDrivingDecode = Boolean(
+                driving_batch_id
+                && driving_frame_count > 0
+                && (exportMode === "clip" || this.clipSource !== "driving")
+            );
+
+            if (front) {
+                const sameRefs = this.lastPythonSyncedRefs
+                    && this.lastPythonSyncedRefs.front === front
+                    && this.lastPythonSyncedRefs.three_quarter === three_quarter
+                    && this.lastPythonSyncedRefs.side === side
+                    && Number(this.lastPythonSyncedRefs.depth_weight) === Number(depth_weight)
+                    && this.reconstructedFace.hasMesh;
+
+                if (!sameRefs) {
+                    await this.loadReferenceImages({
+                        front,
+                        three_quarter,
+                        side,
+                        depth_weight,
+                        driving_batch_id: needDrivingDecode ? driving_batch_id : null,
+                        driving_frame_count: needDrivingDecode ? driving_frame_count : 0,
+                    });
+                    this.lastPythonSyncedRefs = { front, three_quarter, side, depth_weight };
+                } else if (needDrivingDecode) {
+                    await this.loadDrivingBatch(driving_batch_id, driving_frame_count, this.loadToken);
+                }
+            } else if (needDrivingDecode) {
+                await this.loadDrivingBatch(driving_batch_id, driving_frame_count, this.loadToken);
+            }
+
+            if (this.disposed) return;
+
+            this.renderState = this.ui.renderPanel.getState();
+            this.setStatus(`Rendering ${render_width}x${render_height}...`);
+
+            await renderAndUploadPasses({
+                jobId: job_id,
+                renderer: this.renderer,
+                scene: this.scene,
+                liveCamera: this.camera,
+                controlsTarget: this.controls.target,
+                grid: this.grid,
+                reconstructedFace: this.reconstructedFace,
+                placeholderHead: this.placeholderHead,
+                motionClip: this.recordedClip,
+                turntableFrames: turntable_frames,
+                renderState: this.renderState,
+                width: render_width,
+                height: render_height,
+                onProgress: (done, total) => {
+                    this.ui.renderPanel.renderStatus.textContent = `Exported ${done}/${total}f`;
+                    this.ui.renderPanel.renderStatus.style.color = "#38bdf8";
+                },
+            });
+
+            this.updateRenderUI();
+            this.setStatus(`Export Complete (${render_width}x${render_height})`);
+        } catch (err) {
+            console.error("[YedpFace3D] Offscreen render job failed:", err);
+            this.setStatus(`Render error: ${err.message}`, true);
+            await api.fetchApi(`/yedp_face3d/render_error/${job_id}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ error: err?.message || String(err) }),
+            }).catch(() => {});
+        }
+    }
+
     updateRefButtonsUI() {
         this.ui.refStack.setSlotActive("front", Boolean(this.extractedViews.front));
         this.ui.refStack.setSlotActive("three_quarter", Boolean(this.extractedViews.three_quarter));
@@ -534,6 +797,7 @@ export class FaceViewport {
     removeReference(viewKey) {
         this.loadToken++;
         this.reconstructToken++;
+        this.lastPythonSyncedRefs = null;
         this.refUrls[viewKey] = null;
         this.extractedViews[viewKey] = null;
         this.ui.refStack.setPreview(viewKey, null, false);
@@ -561,6 +825,7 @@ export class FaceViewport {
     clearAllReferences() {
         this.loadToken++;
         this.reconstructToken++;
+        this.lastPythonSyncedRefs = null;
         this.stopWebcam();
         this.turntablePlaying = false;
         this.turntableCursor = 0;
@@ -579,10 +844,12 @@ export class FaceViewport {
         this.reconstructedFace.updateLights(this.ui.lightPanel.getState());
         this.reconstructedFace.setRegionWeights(this.ui.weightPanel.getState());
         this.reconstructedFace.setSculptState(this.ui.sculptPanel.getState());
+        this.reconstructedFace.applyRenderState(this.renderState);
         this.reconstructedFace.group.visible = false;
 
         this.placeholderHead.group.visible = true;
         this.placeholderHead.group.rotation.set(0, 0, 0);
+        this.resetCamera();
         this.updateRefButtonsUI();
         this.updateMotionUI();
         this.updateRenderUI();
@@ -601,12 +868,22 @@ export class FaceViewport {
     setTurntableFrames(frames) {
         this.turntableFrames = Math.max(1, Number(frames) || 24);
         this.updateRenderUI();
+        this.updateReadout();
     }
 
     resetCamera() {
         if (!this.camera || !this.controls) return;
-        this.camera.position.set(...DEFAULT_CAMERA_POS);
+        if (this.reconstructedFace?.hasMesh) {
+            this.fitHeadToView();
+            return;
+        }
         this.controls.target.set(...DEFAULT_TARGET);
+        const dist = new THREE.Vector3(...DEFAULT_CAMERA_POS).distanceTo(new THREE.Vector3(...DEFAULT_TARGET));
+        this.orthoHalfH = dist * Math.tan(THREE.MathUtils.degToRad((this.renderState.fov || 36) * 0.5));
+        this.orthoCamera.zoom = 1.0;
+        this.perspCamera.position.set(...DEFAULT_CAMERA_POS);
+        this.orthoCamera.position.set(...DEFAULT_CAMERA_POS);
+        this.applyResize(this.viewportWidth, this.viewportHeight);
         this.controls.update();
     }
 
@@ -653,16 +930,26 @@ export class FaceViewport {
 
         this.viewportWidth = w;
         this.viewportHeight = h;
+        const aspect = w / h;
+
         // Pass updateStyle=false so canvas CSS stays 100% and avoids ResizeObserver loops.
         this.renderer.setSize(w, h, false);
-        this.camera.aspect = w / h;
-        this.camera.updateProjectionMatrix();
+        this.perspCamera.aspect = aspect;
+        this.perspCamera.updateProjectionMatrix();
+
+        this.orthoCamera.left = -this.orthoHalfH * aspect;
+        this.orthoCamera.right = this.orthoHalfH * aspect;
+        this.orthoCamera.top = this.orthoHalfH;
+        this.orthoCamera.bottom = -this.orthoHalfH;
+        this.orthoCamera.updateProjectionMatrix();
+
         this.updateReadout();
     }
 
     updateReadout() {
+        const plan = this.getExportPlan();
         this.ui.sizeReadout.textContent =
-            `Viewport: ${this.viewportWidth}x${this.viewportHeight} | Output: ${this.outputWidth}x${this.outputHeight}`;
+            `Viewport: ${this.viewportWidth}x${this.viewportHeight} | Export: ${this.outputWidth}x${this.outputHeight} · ${plan.frames}f (${plan.label})`;
     }
 
     async stepMotion(nowMs) {
@@ -675,7 +962,9 @@ export class FaceViewport {
             const t = this.turntableFrames > 1
                 ? this.turntableCursor / (this.turntableFrames - 1)
                 : 0.5;
-            const yawDeg = -90 + 180 * t;
+            const startDeg = Number(this.renderState.startAngle ?? -90);
+            const endDeg = Number(this.renderState.endAngle ?? 90);
+            const yawDeg = startDeg + (endDeg - startDeg) * t;
             const yawRad = THREE.MathUtils.degToRad(yawDeg);
             if (this.reconstructedFace.hasMesh) {
                 this.reconstructedFace.setTurntableYaw(yawRad);
@@ -728,7 +1017,7 @@ export class FaceViewport {
             this.stepMotion(nowMs);
             this.controls.update();
             if (this.viewMode === "depth" && this.reconstructedFace.hasMesh) {
-                this.reconstructedFace.updateDepthBounds(this.camera);
+                this.reconstructedFace.updateDepthBounds(this.camera, this.renderState.depthMode === "dynamic");
             }
             this.renderer.render(this.scene, this.camera);
         };

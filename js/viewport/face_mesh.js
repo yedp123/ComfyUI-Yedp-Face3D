@@ -381,18 +381,88 @@ export class ReconstructedFaceMesh {
         this.group.rotation.set(0, yawRad, 0);
     }
 
-    updateDepthBounds(camera) {
+    updateDepthBounds(camera, dynamicMode = false) {
         if (!camera || !this.geometry.boundingSphere) return;
-        this.group.getWorldPosition(_worldCenter);
-        const dist = camera.position.distanceTo(_worldCenter);
-        const r = Math.max(this.geometry.boundingSphere.radius, 0.25);
-        const near = Math.max(0.05, dist - r * 1.05);
-        const far = dist + r * 1.15;
+        this.group.updateMatrixWorld(true);
+
+        let near;
+        let far;
+        if (dynamicMode) {
+            const posAttr = this.geometry.getAttribute("position");
+            if (!posAttr) return;
+            const arr = posAttr.array;
+            const mv = new THREE.Matrix4().multiplyMatrices(camera.matrixWorldInverse, this.mesh.matrixWorld);
+            const pt = new THREE.Vector3();
+            let minZ = Infinity;
+            let maxZ = -Infinity;
+            // Face vertices always occupy indices 0..477 in both base and Phong-subdivided buffers
+            const vLimit = this.guidesVisible ? posAttr.count : Math.min(posAttr.count, 478);
+            for (let i = 0; i < vLimit; i++) {
+                pt.set(arr[i * 3], arr[i * 3 + 1], arr[i * 3 + 2]).applyMatrix4(mv);
+                const vz = -pt.z;
+                if (vz < minZ) minZ = vz;
+                if (vz > maxZ) maxZ = vz;
+            }
+            near = Math.max(0.05, minZ - 0.005);
+            far = Math.max(near + 0.02, maxZ + 0.005);
+        } else {
+            _worldCenter.copy(this.geometry.boundingSphere.center).applyMatrix4(this.group.matrixWorld);
+            const dist = camera.position.distanceTo(_worldCenter);
+            const r = Math.max(this.geometry.boundingSphere.radius, 0.25);
+            near = Math.max(0.05, dist - r * 1.05);
+            far = Math.max(near + 0.2, dist + r * 1.05);
+        }
 
         this.material.uniforms.uDepthNear.value = near;
         this.material.uniforms.uDepthFar.value = far;
         this.guideDepthMat.uniforms.uDepthNear.value = near;
         this.guideDepthMat.uniforms.uDepthFar.value = far;
+        return { near, far };
+    }
+
+    applyRenderState(rs) {
+        if (!rs) return;
+        const u = this.material.uniforms;
+        u.uDepthInvert.value = rs.depthInvert ? 1.0 : 0.0;
+        u.uNormalFlip.value.set(rs.flipX ? -1.0 : 1.0, rs.flipY ? -1.0 : 1.0, rs.flipZ ? -1.0 : 1.0);
+        u.uAlphaMode.value = rs.maskMode === "face" ? 1.0 : 0.0;
+
+        const az = THREE.MathUtils.degToRad(rs.clayKeyAz ?? 30);
+        const el = THREE.MathUtils.degToRad(rs.clayKeyEl ?? 35);
+        u.uClayKeyDir.value.set(
+            Math.cos(el) * Math.sin(az),
+            Math.sin(el),
+            Math.cos(el) * Math.cos(az)
+        ).normalize();
+        u.uClayKeyIntensity.value = Number(rs.clayKeyPower ?? 0.85);
+        u.uClayFillIntensity.value = Number(rs.clayFill ?? 0.35);
+
+        this.guideDepthMat.uniforms.uDepthInvert.value = u.uDepthInvert.value;
+    }
+
+    getWorldBoundingBox() {
+        this.group.updateMatrixWorld(true);
+        const box = new THREE.Box3();
+        const posAttr = this.geometry.getAttribute("position");
+        if (this.hasMesh && posAttr) {
+            if (this.guidesVisible) {
+                this.geometry.computeBoundingBox();
+                if (this.geometry.boundingBox) {
+                    box.copy(this.geometry.boundingBox).applyMatrix4(this.mesh.matrixWorld);
+                    return box;
+                }
+            } else {
+                const pt = new THREE.Vector3();
+                const nFace = Math.min(posAttr.count, 478);
+                for (let i = 0; i < nFace; i++) {
+                    pt.fromBufferAttribute(posAttr, i).applyMatrix4(this.mesh.matrixWorld);
+                    box.expandByPoint(pt);
+                }
+                if (!box.isEmpty()) return box;
+            }
+        }
+        box.setFromObject(this.group);
+        return box;
     }
 
     updateLights({ keyAzimuth, keyElevation, keyIntensity, keyColor, rimAzimuth, rimElevation, rimIntensity, rimColor, ambientIntensity }) {
@@ -420,7 +490,7 @@ export class ReconstructedFaceMesh {
     setViewMode(mode) {
         this.viewMode = mode;
         const isWire = mode === "wireframe";
-        const modeInt = mode === "normals" ? 1 : mode === "depth" ? 2 : 0;
+        const modeInt = mode === "normals" ? 1 : mode === "depth" ? 2 : mode === "clay" ? 3 : 0;
 
         this.material.uniforms.uViewMode.value = modeInt;
         this.material.wireframe = isWire;

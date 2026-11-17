@@ -83,6 +83,8 @@ app.registerExtension({
                 onLightsChange: (lightState) => viewport?.updateLights(lightState),
                 onWeightsChange: (weightState) => viewport?.updateWeights(weightState),
                 onSculptChange: (sculptState) => viewport?.updateSculpt(sculptState),
+                onRenderChange: (renderState, changedKey) => viewport?.updateRenderSettings(renderState, changedKey),
+                onFitHead: (renderState) => viewport?.fitHeadToView(renderState),
                 onSelectRefFile: (viewKey, dataUrl) => viewport?.loadSingleReference(viewKey, dataUrl),
                 onRemoveRefView: (viewKey) => viewport?.removeReference(viewKey),
                 onResetAll: () => viewport?.clearAllReferences(),
@@ -105,10 +107,17 @@ app.registerExtension({
                 if (!detail || !matchesNodeId(detail.node_id, this.id)) return;
                 viewport.loadReferenceImages(detail);
             };
+            const onRenderJob = (event) => {
+                const detail = event?.detail;
+                if (!detail || !matchesNodeId(detail.node_id, this.id)) return;
+                viewport.executeRenderJob(detail);
+            };
             api.addEventListener("yedp_face3d_sync_refs", onSyncRefs);
+            api.addEventListener("yedp_face3d_render_job", onRenderJob);
 
             const cleanup = () => {
                 api.removeEventListener("yedp_face3d_sync_refs", onSyncRefs);
+                api.removeEventListener("yedp_face3d_render_job", onRenderJob);
                 viewport.dispose();
             };
 

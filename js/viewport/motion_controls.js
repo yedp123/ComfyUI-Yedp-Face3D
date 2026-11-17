@@ -20,7 +20,7 @@ function makeBarButton(label, title = "") {
 }
 
 /**
- * Bottom-center shading mode switcher (`Textured | Wire | Normals | Depth | Smooth`).
+ * Bottom-center shading mode switcher (`Textured | Clay | Wire | Normals | Depth | Smooth`).
  */
 export function createMotionBar() {
     const bar = document.createElement("div");
@@ -39,6 +39,7 @@ export function createMotionBar() {
 
     const modes = [
         { id: "textured", label: "Textured" },
+        { id: "clay", label: "Clay" },
         { id: "wireframe", label: "Wire" },
         { id: "normals", label: "Normals" },
         { id: "depth", label: "Depth" },
@@ -51,7 +52,7 @@ export function createMotionBar() {
         bar.appendChild(btn);
     }
 
-    const smoothBtn = makeBarButton("Smooth", "Toggle 1-level Phong curved subdivision (852 -> 3,408 tris)");
+    const smoothBtn = makeBarButton("Smooth", "Toggle 1-level Phong curved subdivision");
     smoothBtn.style.borderColor = "#38bdf8";
     smoothBtn.style.color = "#38bdf8";
     bar.appendChild(smoothBtn);

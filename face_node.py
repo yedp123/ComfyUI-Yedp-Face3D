@@ -1,5 +1,7 @@
+import asyncio
 import base64
 import io as py_io
+import json
 import math
 import numpy as np
 from PIL import Image
@@ -8,7 +10,9 @@ import torch.nn.functional as F
 from comfy_api.latest import io
 from server import PromptServer
 
-from .server_routes import cache_driving_batch
+from .server_routes import cache_driving_batch, create_render_job, pop_render_job
+
+_RENDER_TIMEOUT_SECONDS = 120.0
 
 
 def _frame_to_data_url(frame_tensor: torch.Tensor, max_side: int = 1024, quality: int = 92) -> str:
@@ -65,8 +69,61 @@ def feather_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
     return x.squeeze(1).clamp(0.0, 1.0)
 
 
-def build_phase1_placeholder_passes(
-    front_image: torch.Tensor,
+def unpack_render_job_tensors(
+    job: dict,
+    mask_feather: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
+    """
+    Convert streamed WebGL bottom-up raw uint8 pass buffers into standard ComfyUI CPU tensors:
+    depth [B,H,W,3], normal [B,H,W,3], shaded [B,H,W,3], textured [B,H,W,3], mask [B,H,W].
+    """
+    frames_dict = job["frames"]
+    if not frames_dict:
+        raise RuntimeError("Browser completed render job with zero frames.")
+
+    w = int(job["width"])
+    h = int(job["height"])
+    n_px = w * h
+    frame_indices = sorted(frames_dict.keys())
+    batch_size = len(frame_indices)
+
+    depth_np = np.empty((batch_size, h, w, 3), dtype=np.float32)
+    normal_np = np.empty((batch_size, h, w, 3), dtype=np.float32)
+    shaded_np = np.empty((batch_size, h, w, 3), dtype=np.float32)
+    textured_np = np.empty((batch_size, h, w, 3), dtype=np.float32)
+    mask_np = np.empty((batch_size, h, w), dtype=np.float32)
+
+    inv255 = np.float32(1.0 / 255.0)
+    for b, f_idx in enumerate(frame_indices):
+        raw = frames_dict[f_idx]
+        # Flip vertical scanlines (WebGL readPixels is bottom-up, ComfyUI IMAGE is top-down)
+        d = np.frombuffer(raw, dtype=np.uint8, count=n_px, offset=0).reshape(h, w)[::-1]
+        depth_np[b, :, :, :] = (d.astype(np.float32) * inv255)[:, :, None]
+
+        nrm = np.frombuffer(raw, dtype=np.uint8, count=n_px * 3, offset=n_px).reshape(h, w, 3)[::-1]
+        normal_np[b] = nrm.astype(np.float32) * inv255
+
+        shd = np.frombuffer(raw, dtype=np.uint8, count=n_px * 3, offset=n_px * 4).reshape(h, w, 3)[::-1]
+        shaded_np[b] = shd.astype(np.float32) * inv255
+
+        tex = np.frombuffer(raw, dtype=np.uint8, count=n_px * 3, offset=n_px * 7).reshape(h, w, 3)[::-1]
+        textured_np[b] = tex.astype(np.float32) * inv255
+
+        msk = np.frombuffer(raw, dtype=np.uint8, count=n_px, offset=n_px * 10).reshape(h, w)[::-1]
+        mask_np[b] = msk.astype(np.float32) * inv255
+
+    depth_t = torch.from_numpy(depth_np)
+    normal_t = torch.from_numpy(normal_np)
+    shaded_t = torch.from_numpy(shaded_np)
+    textured_t = torch.from_numpy(textured_np)
+    mask_t = feather_mask(torch.from_numpy(mask_np), mask_feather)
+
+    metadata_json = json.dumps(job.get("metadata") or {}, separators=(",", ":"))
+    return depth_t, normal_t, shaded_t, textured_t, mask_t, metadata_json
+
+
+def build_fallback_passes(
+    front_image: torch.Tensor | None,
     driving_video: torch.Tensor | None,
     depth_weight: float,
     render_width: int,
@@ -74,8 +131,8 @@ def build_phase1_placeholder_passes(
     turntable_frames: int,
     mask_feather: int,
     anatomical_guides: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Generate zero-VRAM CPU placeholder passes matching final Phase 4 shapes and dtypes."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
+    """Generate zero-VRAM CPU fallback passes when executed headless without a browser WebSocket."""
     batch_size = int(driving_video.shape[0]) if driving_video is not None else int(turntable_frames)
     batch_size = max(1, batch_size)
 
@@ -83,7 +140,6 @@ def build_phase1_placeholder_passes(
     xs = torch.linspace(-1.0, 1.0, render_width, dtype=torch.float32)
     grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
 
-    # Elliptical head silhouette + optional minimal neck stub for Phase 1 pipeline wiring tests.
     head_r2 = (grid_x / 0.38) ** 2 + ((grid_y + 0.06) / 0.52) ** 2
     inside_head = head_r2 <= 1.0
 
@@ -95,54 +151,61 @@ def build_phase1_placeholder_passes(
 
     z_surface = torch.sqrt((1.0 - head_r2.clamp(max=1.0)).clamp(min=0.0))
     depth_scale = max(0.0, min(depth_weight, 2.5))
-    depth_single = (z_surface * (0.55 + 0.35 * min(depth_scale, 1.5)) + 0.1 * inside_head.to(torch.float32)).clamp(0.0, 1.0)
-    if anatomical_guides:
-        neck_only = (~inside_head) & (silhouette > 0.5)
-        depth_single = torch.where(neck_only, torch.full_like(depth_single, 0.25), depth_single)
+    depth_single = torch.where(
+        silhouette > 0.5,
+        (z_surface * (0.55 + 0.35 * min(depth_scale, 1.5)) + 0.05).clamp(0.05, 1.0),
+        torch.zeros_like(silhouette),
+    )
 
     nx = (grid_x / 0.38) * silhouette
     ny = (-(grid_y + 0.06) / 0.52) * silhouette
     nz = z_surface.clamp(min=0.1) * silhouette + (1.0 - silhouette)
-    norm_vec = torch.stack((nx, ny, nz), dim=-1)
-    norm_vec = F.normalize(norm_vec, p=2, dim=-1)
+    norm_vec = F.normalize(torch.stack((nx, ny, nz), dim=-1), p=2, dim=-1)
     normal_single = torch.where(
         silhouette.unsqueeze(-1) > 0.5,
         (norm_vec * 0.5) + 0.5,
-        torch.tensor([0.5, 0.5, 1.0], dtype=torch.float32),
+        torch.zeros((render_height, render_width, 3), dtype=torch.float32),
     )
 
-    # Sample average front skin tone for the Phase 1 shaded placeholder without GPU work.
-    avg_color = front_image[0].detach().to("cpu", dtype=torch.float32).mean(dim=(0, 1)).clamp(0.15, 0.95)
+    if front_image is not None and front_image.numel() > 0:
+        avg_color = front_image[0].detach().to("cpu", dtype=torch.float32).mean(dim=(0, 1)).clamp(0.15, 0.95)
+    else:
+        avg_color = torch.tensor([0.75, 0.62, 0.55], dtype=torch.float32)
+
     key_light = F.normalize(torch.tensor([0.45, 0.55, 0.70], dtype=torch.float32), dim=0)
     lambert = (norm_vec * key_light).sum(dim=-1).clamp(min=0.0)
-    shade = (0.28 + 0.72 * lambert).unsqueeze(-1)
-    bg_color = torch.tensor([0.08, 0.09, 0.11], dtype=torch.float32)
-    lit_single = torch.where(
-        silhouette.unsqueeze(-1) > 0.5,
-        (avg_color.view(1, 1, 3) * shade).clamp(0.0, 1.0),
-        bg_color.view(1, 1, 3),
-    )
+    shade = (0.35 + 0.65 * lambert).unsqueeze(-1)
+    bg_color = torch.zeros((1, 1, 3), dtype=torch.float32)
+    clay_albedo = torch.tensor([0.66, 0.66, 0.66], dtype=torch.float32).view(1, 1, 3)
 
+    shaded_single = torch.where(silhouette.unsqueeze(-1) > 0.5, (clay_albedo * shade).clamp(0.0, 1.0), bg_color)
+    textured_single = torch.where(silhouette.unsqueeze(-1) > 0.5, (avg_color.view(1, 1, 3) * shade).clamp(0.0, 1.0), bg_color)
     depth_single_rgb = depth_single.unsqueeze(-1).repeat(1, 1, 3)
 
-    lit_batch = lit_single.unsqueeze(0).repeat(batch_size, 1, 1, 1)
     depth_batch = depth_single_rgb.unsqueeze(0).repeat(batch_size, 1, 1, 1)
     normal_batch = normal_single.unsqueeze(0).repeat(batch_size, 1, 1, 1)
-
-    raw_mask_batch = silhouette.unsqueeze(0).repeat(batch_size, 1, 1)
-    feathered_mask = feather_mask(raw_mask_batch, mask_feather)
+    shaded_batch = shaded_single.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+    textured_batch = textured_single.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+    feathered_mask = feather_mask(silhouette.unsqueeze(0).repeat(batch_size, 1, 1), mask_feather)
 
     if batch_size > 1 and driving_video is None:
-        # Subtle brightness pulse across turntable placeholder frames to confirm batch order.
         angles = torch.linspace(-math.pi / 2, math.pi / 2, batch_size, dtype=torch.float32)
         mod = (0.88 + 0.12 * torch.cos(angles)).view(batch_size, 1, 1, 1)
-        lit_batch = (lit_batch * mod).clamp(0.0, 1.0)
+        shaded_batch = (shaded_batch * mod).clamp(0.0, 1.0)
+        textured_batch = (textured_batch * mod).clamp(0.0, 1.0)
 
-    return lit_batch, depth_batch, normal_batch, feathered_mask
+    metadata = json.dumps({
+        "projection": "ortho",
+        "resolution": [render_width, render_height],
+        "frame_count": batch_size,
+        "motion_source": "headless_fallback",
+        "depth_mode": "fixed",
+    })
+    return depth_batch, normal_batch, shaded_batch, textured_batch, feathered_mask, metadata
 
 
 class YedpFace3D(io.ComfyNode):
-    """ComfyUI V3 node for multi-view 3D face reconstruction, mocap, relighting, and multi-pass export."""
+    """ComfyUI V3 node for multi-view 3D face reconstruction, mocap, clay/relighting, and offscreen pass export."""
 
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -151,19 +214,21 @@ class YedpFace3D(io.ComfyNode):
             display_name="Yedp Face3D",
             category="Yedp/Face3D",
             description=(
-                "Reconstructs a canonical 478-vertex 3D face on CPU, animates via ARKit/video/webcam, "
-                "relights interactively in Three.js, and exports 4 synchronized ControlNet passes."
+                "Reconstructs a canonical 3D face + welded head shell on CPU, animates via webcam or video, "
+                "and exports synchronized Depth, Normal, Shaded Clay, Textured, Mask passes, and camera metadata."
             ),
             search_aliases=["face3d", "3d face", "mediapipe", "relight", "face mocap"],
+            not_idempotent=True,
             inputs=[
                 io.Image.Input(
                     "front_image",
-                    tooltip="Primary front-facing reference portrait.",
+                    optional=True,
+                    tooltip="Primary front-facing reference portrait (optional if loaded via viewport stack).",
                 ),
                 io.Image.Input(
                     "three_quarter_image",
                     optional=True,
-                    tooltip="Optional 3/4 view photo for lateral cheek depth and texture blending.",
+                    tooltip="Optional 3/4 view photo for lateral cheek depth refinement.",
                 ),
                 io.Image.Input(
                     "side_image",
@@ -189,7 +254,7 @@ class YedpFace3D(io.ComfyNode):
                     min=128,
                     max=2048,
                     step=8,
-                    tooltip="Output render width for all 4 exported passes.",
+                    tooltip="Output render width for all exported passes.",
                 ),
                 io.Int.Input(
                     "render_height",
@@ -197,7 +262,7 @@ class YedpFace3D(io.ComfyNode):
                     min=128,
                     max=2048,
                     step=8,
-                    tooltip="Output render height for all 4 exported passes.",
+                    tooltip="Output render height for all exported passes.",
                 ),
                 io.Int.Input(
                     "turntable_frames",
@@ -205,7 +270,7 @@ class YedpFace3D(io.ComfyNode):
                     min=1,
                     max=240,
                     step=1,
-                    tooltip="Frame count for the -90 to +90 deg turntable sweep when no driving video is connected.",
+                    tooltip="Frame count for the turntable sweep when no driving or recorded clip is active.",
                 ),
                 io.Int.Input(
                     "mask_feather",
@@ -213,22 +278,17 @@ class YedpFace3D(io.ComfyNode):
                     min=0,
                     max=64,
                     step=1,
-                    tooltip="Soft Gaussian feather radius in pixels along the outer edge of face_mask.",
+                    tooltip="Soft Gaussian feather radius in pixels along the outer edge of mask_pass.",
                 ),
                 io.Boolean.Input(
                     "anatomical_guides",
                     default=True,
-                    label_on="Visible",
-                    label_off="Hidden",
-                    tooltip="Show toggleable minimal neck column cylinder and ear anchor markers.",
+                    label_on="Head+Neck",
+                    label_off="Face Only",
+                    tooltip="Render full head shell + ears + neck (Head+Neck) or restrict all passes & viewport to the 478-vertex face (Face Only).",
                 ),
             ],
             outputs=[
-                io.Image.Output(
-                    id="lit_color_pass",
-                    display_name="lit_color_pass",
-                    tooltip="Textured, 3D-lit face render batch.",
-                ),
                 io.Image.Output(
                     id="depth_pass",
                     display_name="depth_pass",
@@ -237,52 +297,91 @@ class YedpFace3D(io.ComfyNode):
                 io.Image.Output(
                     id="normal_pass",
                     display_name="normal_pass",
-                    tooltip="RGB surface normal batch.",
+                    tooltip="Unlit camera-space RGB surface normal batch.",
+                ),
+                io.Image.Output(
+                    id="shaded_pass",
+                    display_name="shaded_pass",
+                    tooltip="Neutral gray Clay render batch.",
+                ),
+                io.Image.Output(
+                    id="textured_pass",
+                    display_name="textured_pass",
+                    tooltip="Textured and 3D-lit portrait batch.",
                 ),
                 io.Mask.Output(
-                    id="face_mask",
-                    display_name="face_mask",
-                    tooltip="Soft-feathered alpha silhouette mask of the 3D face.",
+                    id="mask_pass",
+                    display_name="mask_pass",
+                    tooltip="Soft-feathered head or face silhouette mask batch.",
+                ),
+                io.String.Output(
+                    id="metadata_json",
+                    display_name="metadata_json",
+                    tooltip="JSON metadata describing projection, resolution, depth bounds, and frame angles.",
                 ),
             ],
             hidden=[io.Hidden.unique_id],
         )
 
     @classmethod
-    def execute(
+    async def execute(
         cls,
-        front_image: torch.Tensor,
         depth_weight: float,
         render_width: int,
         render_height: int,
         turntable_frames: int,
         mask_feather: int,
         anatomical_guides: bool,
+        front_image: torch.Tensor | None = None,
         three_quarter_image: torch.Tensor | None = None,
         side_image: torch.Tensor | None = None,
         driving_video: torch.Tensor | None = None,
     ) -> io.NodeOutput:
-        # Push reference images (and optional driving video batch ID) to the browser viewport.
         prompt_server = getattr(PromptServer, "instance", None)
         node_id = getattr(cls.hidden, "unique_id", None)
-        if prompt_server is not None and node_id is not None:
+        has_clients = bool(prompt_server is not None and getattr(prompt_server, "sockets", None))
+
+        if prompt_server is not None and node_id is not None and has_clients:
             driving_frames = _batch_to_data_urls(driving_video, max_side=512)
             driving_batch_id = cache_driving_batch(driving_frames) if driving_frames else None
-            prompt_server.send_sync(
-                "yedp_face3d_sync_refs",
-                {
-                    "node_id": str(node_id),
-                    "front": _tensor_to_data_url(front_image),
-                    "three_quarter": _tensor_to_data_url(three_quarter_image),
-                    "side": _tensor_to_data_url(side_image),
-                    "depth_weight": float(depth_weight),
-                    "driving_batch_id": driving_batch_id,
-                    "driving_frame_count": len(driving_frames),
-                },
-            )
+            job_id, job = create_render_job(render_width, render_height)
 
-        # Phases 3-4 will add animation playback and offscreen multi-pass WebGL capture.
-        lit_pass, depth_pass, normal_pass, face_mask = build_phase1_placeholder_passes(
+            try:
+                prompt_server.send_sync(
+                    "yedp_face3d_render_job",
+                    {
+                        "node_id": str(node_id),
+                        "job_id": job_id,
+                        "front": _tensor_to_data_url(front_image),
+                        "three_quarter": _tensor_to_data_url(three_quarter_image),
+                        "side": _tensor_to_data_url(side_image),
+                        "depth_weight": float(depth_weight),
+                        "driving_batch_id": driving_batch_id,
+                        "driving_frame_count": len(driving_frames),
+                        "render_width": int(render_width),
+                        "render_height": int(render_height),
+                        "turntable_frames": int(turntable_frames),
+                        "anatomical_guides": bool(anatomical_guides),
+                    },
+                )
+
+                loop = asyncio.get_running_loop()
+                completed = await loop.run_in_executor(None, job["event"].wait, _RENDER_TIMEOUT_SECONDS)
+                if not completed:
+                    raise TimeoutError(
+                        f"Timed out waiting for browser WebGL render ({_RENDER_TIMEOUT_SECONDS:.0f}s)."
+                    )
+                if job.get("error"):
+                    raise RuntimeError(f"Browser render failed: {job['error']}")
+
+                depth_t, normal_t, shaded_t, textured_t, mask_t, meta = unpack_render_job_tensors(
+                    job, mask_feather
+                )
+                return io.NodeOutput(depth_t, normal_t, shaded_t, textured_t, mask_t, meta)
+            finally:
+                pop_render_job(job_id)
+
+        depth_t, normal_t, shaded_t, textured_t, mask_t, meta = build_fallback_passes(
             front_image=front_image,
             driving_video=driving_video,
             depth_weight=depth_weight,
@@ -292,4 +391,4 @@ class YedpFace3D(io.ComfyNode):
             mask_feather=mask_feather,
             anatomical_guides=anatomical_guides,
         )
-        return io.NodeOutput(lit_pass, depth_pass, normal_pass, face_mask)
+        return io.NodeOutput(depth_t, normal_t, shaded_t, textured_t, mask_t, meta)
