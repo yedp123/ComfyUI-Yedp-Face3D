@@ -156,6 +156,19 @@ export class HeadShellRig {
         this.shellToMerged = shellToMerged;
         this.interiorShellIds = interiorShellIds;
         this.nInterior = interiorShellIds.length;
+        this.neckLoopMerged = neckLoop
+            .map((sid) => shellToMerged[sid])
+            .filter((mid) => mid >= 478);
+
+        // Identify left (+X) and right (-X) ear clusters in baked shell coords for OpenPose anchors
+        const earThresholdX = this.shellSocketFrame.spanX * 0.55;
+        this.leftEarMerged = [];
+        this.rightEarMerged = [];
+        for (const sid of interiorShellIds) {
+            const dx = this.rawShellPos[sid * 3] - this.shellSocketFrame.cx;
+            if (dx >= earThresholdX) this.leftEarMerged.push(shellToMerged[sid]);
+            else if (dx <= -earThresholdX) this.rightEarMerged.push(shellToMerged[sid]);
+        }
 
         // Remap shell triangles using merged vertex indices so the 36-vertex seam is shared
         this.mergedShellIndices = new Array(shellIndices.length);

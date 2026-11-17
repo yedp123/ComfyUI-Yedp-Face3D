@@ -124,7 +124,7 @@ def register_static_routes(package_dir: Path) -> None:
         if width != job["width"] or height != job["height"] or frame_count == 0:
             return web.json_response({"error": "Render chunk dimensions mismatch job."}, status=400)
 
-        frame_stride = width * height * 11
+        frame_stride = width * height * 14
         expected_len = 16 + frame_count * frame_stride
         if len(body) != expected_len:
             return web.json_response(

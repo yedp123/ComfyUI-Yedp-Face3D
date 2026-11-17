@@ -72,10 +72,10 @@ def feather_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
 def unpack_render_job_tensors(
     job: dict,
     mask_feather: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
     """
     Convert streamed WebGL bottom-up raw uint8 pass buffers into standard ComfyUI CPU tensors:
-    depth [B,H,W,3], normal [B,H,W,3], shaded [B,H,W,3], textured [B,H,W,3], mask [B,H,W].
+    depth [B,H,W,3], normal [B,H,W,3], shaded [B,H,W,3], textured [B,H,W,3], pose [B,H,W,3], mask [B,H,W].
     """
     frames_dict = job["frames"]
     if not frames_dict:
@@ -91,6 +91,7 @@ def unpack_render_job_tensors(
     normal_np = np.empty((batch_size, h, w, 3), dtype=np.float32)
     shaded_np = np.empty((batch_size, h, w, 3), dtype=np.float32)
     textured_np = np.empty((batch_size, h, w, 3), dtype=np.float32)
+    pose_np = np.empty((batch_size, h, w, 3), dtype=np.float32)
     mask_np = np.empty((batch_size, h, w), dtype=np.float32)
 
     inv255 = np.float32(1.0 / 255.0)
@@ -112,14 +113,18 @@ def unpack_render_job_tensors(
         msk = np.frombuffer(raw, dtype=np.uint8, count=n_px, offset=n_px * 10).reshape(h, w)[::-1]
         mask_np[b] = msk.astype(np.float32) * inv255
 
+        pse = np.frombuffer(raw, dtype=np.uint8, count=n_px * 3, offset=n_px * 11).reshape(h, w, 3)[::-1]
+        pose_np[b] = pse.astype(np.float32) * inv255
+
     depth_t = torch.from_numpy(depth_np)
     normal_t = torch.from_numpy(normal_np)
     shaded_t = torch.from_numpy(shaded_np)
     textured_t = torch.from_numpy(textured_np)
+    pose_t = torch.from_numpy(pose_np)
     mask_t = feather_mask(torch.from_numpy(mask_np), mask_feather)
 
     metadata_json = json.dumps(job.get("metadata") or {}, separators=(",", ":"))
-    return depth_t, normal_t, shaded_t, textured_t, mask_t, metadata_json
+    return depth_t, normal_t, shaded_t, textured_t, pose_t, mask_t, metadata_json
 
 
 def build_fallback_passes(
@@ -131,7 +136,7 @@ def build_fallback_passes(
     turntable_frames: int,
     mask_feather: int,
     anatomical_guides: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
     """Generate zero-VRAM CPU fallback passes when executed headless without a browser WebSocket."""
     batch_size = int(driving_video.shape[0]) if driving_video is not None else int(turntable_frames)
     batch_size = max(1, batch_size)
@@ -182,10 +187,27 @@ def build_fallback_passes(
     textured_single = torch.where(silhouette.unsqueeze(-1) > 0.5, (avg_color.view(1, 1, 3) * shade).clamp(0.0, 1.0), bg_color)
     depth_single_rgb = depth_single.unsqueeze(-1).repeat(1, 1, 3)
 
+    # Headless fallback OpenPose keypoints (Nose, L/R Eye, L/R Ear, optional Neck)
+    pose_single = torch.zeros((render_height, render_width, 3), dtype=torch.float32)
+    kp_specs = [
+        (0.0, -0.02, (1.0, 0.0, 0.0)),      # Nose
+        (0.14, -0.14, (1.0, 0.0, 1.0)),     # L_Eye
+        (-0.14, -0.14, (0.667, 0.0, 1.0)),  # R_Eye
+        (0.32, -0.06, (1.0, 0.0, 0.333)),   # L_Ear
+        (-0.32, -0.06, (1.0, 0.0, 0.667)),  # R_Ear
+    ]
+    if anatomical_guides:
+        kp_specs.append((0.0, 0.58, (1.0, 0.333, 0.0)))  # Neck
+    for kx, ky, col in kp_specs:
+        dot_mask = ((grid_x - kx) ** 2 + (grid_y - ky) ** 2) <= (0.045 ** 2)
+        for ch in range(3):
+            pose_single[:, :, ch] = torch.where(dot_mask, col[ch], pose_single[:, :, ch])
+
     depth_batch = depth_single_rgb.unsqueeze(0).repeat(batch_size, 1, 1, 1)
     normal_batch = normal_single.unsqueeze(0).repeat(batch_size, 1, 1, 1)
     shaded_batch = shaded_single.unsqueeze(0).repeat(batch_size, 1, 1, 1)
     textured_batch = textured_single.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+    pose_batch = pose_single.unsqueeze(0).repeat(batch_size, 1, 1, 1)
     feathered_mask = feather_mask(silhouette.unsqueeze(0).repeat(batch_size, 1, 1), mask_feather)
 
     if batch_size > 1 and driving_video is None:
@@ -200,8 +222,9 @@ def build_fallback_passes(
         "frame_count": batch_size,
         "motion_source": "headless_fallback",
         "depth_mode": "fixed",
+        "pose_mode": "head_face",
     })
-    return depth_batch, normal_batch, shaded_batch, textured_batch, feathered_mask, metadata
+    return depth_batch, normal_batch, shaded_batch, textured_batch, pose_batch, feathered_mask, metadata
 
 
 class YedpFace3D(io.ComfyNode):
@@ -215,7 +238,7 @@ class YedpFace3D(io.ComfyNode):
             category="Yedp/Face3D",
             description=(
                 "Reconstructs a canonical 3D face + welded head shell on CPU, animates via webcam or video, "
-                "and exports synchronized Depth, Normal, Shaded Clay, Textured, Mask passes, and camera metadata."
+                "and exports synchronized Depth, Normal, Shaded Clay, Textured, OpenPose Head+Face, Mask passes, and camera metadata."
             ),
             search_aliases=["face3d", "3d face", "mediapipe", "relight", "face mocap"],
             not_idempotent=True,
@@ -309,6 +332,11 @@ class YedpFace3D(io.ComfyNode):
                     display_name="textured_pass",
                     tooltip="Textured and 3D-lit portrait batch.",
                 ),
+                io.Image.Output(
+                    id="pose_pass",
+                    display_name="pose_pass",
+                    tooltip="Unlit OpenPose Head+Neck skeleton and 70-point facial expression keypoints batch.",
+                ),
                 io.Mask.Output(
                     id="mask_pass",
                     display_name="mask_pass",
@@ -374,14 +402,14 @@ class YedpFace3D(io.ComfyNode):
                 if job.get("error"):
                     raise RuntimeError(f"Browser render failed: {job['error']}")
 
-                depth_t, normal_t, shaded_t, textured_t, mask_t, meta = unpack_render_job_tensors(
+                depth_t, normal_t, shaded_t, textured_t, pose_t, mask_t, meta = unpack_render_job_tensors(
                     job, mask_feather
                 )
-                return io.NodeOutput(depth_t, normal_t, shaded_t, textured_t, mask_t, meta)
+                return io.NodeOutput(depth_t, normal_t, shaded_t, textured_t, pose_t, mask_t, meta)
             finally:
                 pop_render_job(job_id)
 
-        depth_t, normal_t, shaded_t, textured_t, mask_t, meta = build_fallback_passes(
+        depth_t, normal_t, shaded_t, textured_t, pose_t, mask_t, meta = build_fallback_passes(
             front_image=front_image,
             driving_video=driving_video,
             depth_weight=depth_weight,
@@ -391,4 +419,4 @@ class YedpFace3D(io.ComfyNode):
             mask_feather=mask_feather,
             anatomical_guides=anatomical_guides,
         )
-        return io.NodeOutput(depth_t, normal_t, shaded_t, textured_t, mask_t, meta)
+        return io.NodeOutput(depth_t, normal_t, shaded_t, textured_t, pose_t, mask_t, meta)

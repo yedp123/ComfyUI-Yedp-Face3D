@@ -21,6 +21,10 @@ export const DEFAULT_RENDER_STATE = {
     bgBrightness: 0.0,
     maskMode: "full",
     antialias: "normal",
+    poseMode: "head_face",
+    poseDotScale: 1.0,
+    poseOcclude: true,
+    poseOverlay: false,
 };
 
 function makeRenderButton(label, title = "") {
@@ -268,6 +272,17 @@ export function createRenderPanel(onChange, onFitHead) {
     addSegmented("MSAA", "antialias", [
         { label: "Draft", value: "draft" },
         { label: "4x", value: "normal" },
+    ]);
+
+    addSection("OpenPose Pass");
+    addSegmented("Pose Parts", "poseMode", [
+        { label: "Head+Face", value: "head_face", title: "Render Head/Neck OpenPose skeleton + 70-pt white facial keypoints" },
+        { label: "Face 70pt", value: "face_only", title: "Render strictly the 70-pt white facial expression keypoints" },
+    ]);
+    addSlider("Dot Scale", "poseDotScale", 0.4, 2.0, 0.05);
+    addToggleRow([
+        { label: "Self-Occlude", key: "poseOcclude" },
+        { label: "Overlay", key: "poseOverlay" },
     ]);
 
     const outputSpec = document.createElement("div");

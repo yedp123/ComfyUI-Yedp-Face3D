@@ -2,18 +2,21 @@ import * as THREE from "../lib/three.module.js";
 import {
     createFaceMaterial,
     createGuideDepthMaterial,
+    createDepthHullMaterial,
     createPlaceholderTexture,
 } from "./face_shader.js";
 import { FaceRetargetRig } from "../vision/retarget_rig.js";
 import { SculptRig } from "../vision/sculpt_rig.js";
 import { MeshSubdivider } from "./mesh_subdiv.js";
-import { fetchWeldedGlbMesh } from "./glb_loader.js";
+import { fetchWeldedGlbMesh, fetchOpenPoseRigGlb } from "./glb_loader.js";
 import { HeadShellRig } from "./head_shell_rig.js";
+import { OpenPoseFaceRig } from "./openpose_rig.js";
 
 const _worldCenter = new THREE.Vector3();
 const SKIN_SAMPLE_LANDMARKS = [50, 280, 117, 346, 151, 9, 195];
 
 let _headShellRigPromise = null;
+let _openPoseRigDataPromise = null;
 
 function getHeadShellRig() {
     if (!_headShellRigPromise) {
@@ -26,6 +29,17 @@ function getHeadShellRig() {
             });
     }
     return _headShellRigPromise;
+}
+
+function getOpenPoseRigData() {
+    if (!_openPoseRigDataPromise) {
+        const glbUrl = new URL("../../assets/Yedp_Rig.glb", import.meta.url).href;
+        _openPoseRigDataPromise = fetchOpenPoseRigGlb(glbUrl).catch((err) => {
+            console.warn("[YedpFace3D] Optional Yedp_Rig.glb OpenPose not loaded:", err?.message || err);
+            return null;
+        });
+    }
+    return _openPoseRigDataPromise;
 }
 
 function sampleMedianSkinColor(img, uvs) {
@@ -126,6 +140,14 @@ export class ReconstructedFaceMesh {
         this.guidesGroup.add(this.neckMesh, this.leftEarMesh, this.rightEarMesh);
 
         this.group.add(this.mesh, this.guidesGroup);
+
+        this.depthHullMaterial = createDepthHullMaterial();
+        this.depthHullMesh = new THREE.Mesh(this.geometry, this.depthHullMaterial);
+        this.depthHullMesh.visible = false;
+        this.depthHullMesh.renderOrder = 0;
+        this.depthHullMesh.frustumCulled = false;
+        this.group.add(this.depthHullMesh);
+
         this.frontTexture = null;
 
         this.basePositions = null;
@@ -144,6 +166,7 @@ export class ReconstructedFaceMesh {
 
         this.shellRig = null;
         this.shellFitState = null;
+        this.openPoseRig = null;
         this.sculptRig = null;
         this.morphRig = null;
         this.subdivider = null;
@@ -155,16 +178,36 @@ export class ReconstructedFaceMesh {
         this.guidesVisible = true;
         this.hasMesh = false;
         this.viewMode = "textured";
+        this.poseMode = "head_face";
+        this.poseDotScale = 1.0;
+        this.poseOcclude = true;
+        this.poseOverlay = false;
 
-        // Start warming the cached head_shell.glb fetch immediately in browser environments
+        // Start warming cached GLB fetches immediately in browser environments
         if (typeof window !== "undefined" && typeof fetch === "function") {
             getHeadShellRig().then((rig) => {
                 if (rig) this.shellRig = rig;
             });
+            getOpenPoseRigData().then((data) => {
+                if (data) this.attachOpenPoseData(data);
+            });
         }
     }
 
-    async updateFromReconstruction(meshData, frontImageUrl, overrideShellRig = undefined) {
+    attachOpenPoseData(data) {
+        if (!data || this.openPoseRig) return;
+        this.openPoseRig = new OpenPoseFaceRig(data);
+        this.group.add(this.openPoseRig.group);
+        if (this.hasMesh) {
+            const activePos = this.lastMotionFrame
+                ? (this.shellRig ? this.mergedScratch : this.animScratch)
+                : this.mergedPositions;
+            this.openPoseRig.updateFromPositions(activePos || this.mergedPositions, this.shellRig, this.guidesVisible);
+        }
+        this.syncPoseVisibility();
+    }
+
+    async updateFromReconstruction(meshData, frontImageUrl, overrideShellRig = undefined, overrideOpenPoseData = undefined) {
         this.basePositions = new Float32Array(meshData.positions);
         this.baseIndices = meshData.indices;
         this.baseUvs = new Float32Array(meshData.uv_front);
@@ -178,6 +221,13 @@ export class ReconstructedFaceMesh {
             this.shellRig = overrideShellRig;
         } else if (!this.shellRig && typeof window !== "undefined" && typeof fetch === "function") {
             this.shellRig = await getHeadShellRig();
+        }
+
+        if (overrideOpenPoseData !== undefined) {
+            if (overrideOpenPoseData) this.attachOpenPoseData(overrideOpenPoseData);
+        } else if (!this.openPoseRig && typeof window !== "undefined" && typeof fetch === "function") {
+            const opData = await getOpenPoseRigData();
+            if (opData) this.attachOpenPoseData(opData);
         }
 
         if (this.shellRig) {
@@ -231,8 +281,9 @@ export class ReconstructedFaceMesh {
 
         await this.updateFrontTexture(frontImageUrl);
         this.updateGuideAnchors(meshData.anchors);
-        this.applyGuideVisibility();
         this.hasMesh = true;
+        this.applyGuideVisibility();
+        this.syncPoseVisibility();
     }
 
     bindActiveTopology() {
@@ -265,8 +316,10 @@ export class ReconstructedFaceMesh {
     }
 
     applyGuideVisibility() {
-        this.guidesGroup.visible = !this.shellRig && this.guidesVisible;
+        const isPose = this.viewMode === "pose";
+        this.guidesGroup.visible = !isPose && !this.shellRig && this.guidesVisible;
         this.applyDrawRange();
+        this.openPoseRig?.setOptions({ guidesVisible: this.guidesVisible });
     }
 
     uploadPositions(mergedOrFacePos) {
@@ -280,6 +333,16 @@ export class ReconstructedFaceMesh {
         }
         posAttr.needsUpdate = true;
         this.geometry.computeVertexNormals();
+
+        if (mergedOrFacePos.length >= 455 * 3) {
+            const spanX = Math.max(Math.abs(mergedOrFacePos[454 * 3] - mergedOrFacePos[234 * 3]), 0.1);
+            const cx = 0.5 * (mergedOrFacePos[234 * 3] + mergedOrFacePos[454 * 3]);
+            const cy = 0.5 * (mergedOrFacePos[10 * 3 + 1] + mergedOrFacePos[152 * 3 + 1]);
+            const czTemple = 0.5 * (mergedOrFacePos[234 * 3 + 2] + mergedOrFacePos[454 * 3 + 2]);
+            const cz = czTemple - (this.guidesVisible && this.shellRig ? 0.14 : 0.18) * spanX;
+            this.depthHullMaterial.uniforms.uHullCenter.value.set(cx, cy, cz);
+        }
+        this.openPoseRig?.updateFromPositions(mergedOrFacePos, this.shellRig, this.guidesVisible);
     }
 
     uploadFaceFrame(facePos) {
@@ -438,6 +501,30 @@ export class ReconstructedFaceMesh {
         u.uClayFillIntensity.value = Number(rs.clayFill ?? 0.35);
 
         this.guideDepthMat.uniforms.uDepthInvert.value = u.uDepthInvert.value;
+
+        this.poseMode = rs.poseMode || "head_face";
+        this.poseDotScale = Number(rs.poseDotScale ?? 1.0);
+        this.poseOcclude = rs.poseOcclude !== false;
+        this.poseOverlay = Boolean(rs.poseOverlay);
+        this.syncPoseVisibility();
+    }
+
+    syncPoseVisibility() {
+        const isPose = this.viewMode === "pose";
+        this.mesh.visible = !isPose;
+        this.guidesGroup.visible = !isPose && !this.shellRig && this.guidesVisible;
+        this.depthHullMesh.visible = isPose && this.hasMesh && this.poseOcclude;
+
+        if (this.openPoseRig) {
+            this.openPoseRig.group.visible = this.hasMesh && (isPose || this.poseOverlay);
+            this.openPoseRig.setOptions({
+                poseMode: this.poseMode,
+                dotScale: this.poseDotScale,
+                occlude: this.poseOcclude,
+                guidesVisible: this.guidesVisible,
+                overlay: !isPose && this.poseOverlay,
+            });
+        }
     }
 
     getWorldBoundingBox() {
@@ -510,6 +597,7 @@ export class ReconstructedFaceMesh {
             this.guideMat.wireframe = isWire;
             this.earMat.wireframe = isWire;
         }
+        this.syncPoseVisibility();
     }
 
     setGuidesVisible(visible) {
@@ -561,6 +649,7 @@ export class ReconstructedFaceMesh {
         this.group.rotation.set(0, 0, 0);
         this.group.quaternion.identity();
         this.hasMesh = false;
+        this.syncPoseVisibility();
     }
 
     dispose() {
@@ -568,6 +657,8 @@ export class ReconstructedFaceMesh {
         this.fallbackTex.dispose();
         this.geometry.dispose();
         this.material.dispose();
+        this.depthHullMaterial.dispose();
+        this.openPoseRig?.dispose();
         this.neckGeo.dispose();
         this.earGeo.dispose();
         this.guideMat.dispose();

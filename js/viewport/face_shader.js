@@ -171,3 +171,61 @@ export function createGuideDepthMaterial() {
         },
     });
 }
+
+const DEPTH_HULL_VERTEX = /* glsl */ `
+    uniform vec3 uHullCenter;
+    uniform float uHullScale;
+    void main() {
+        vec3 hullPos = mix(uHullCenter, position, uHullScale);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(hullPos, 1.0);
+    }
+`;
+
+const DEPTH_HULL_FRAGMENT = /* glsl */ `
+    void main() {
+        gl_FragColor = vec4(0.0);
+    }
+`;
+
+const OPENPOSE_VERTEX = /* glsl */ `
+    attribute vec3 color;
+    varying vec3 vColor;
+    void main() {
+        vColor = color;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+`;
+
+const OPENPOSE_FRAGMENT = /* glsl */ `
+    varying vec3 vColor;
+    void main() {
+        gl_FragColor = vec4(vColor, 1.0);
+    }
+`;
+
+export function createDepthHullMaterial() {
+    return new THREE.ShaderMaterial({
+        vertexShader: DEPTH_HULL_VERTEX,
+        fragmentShader: DEPTH_HULL_FRAGMENT,
+        side: THREE.DoubleSide,
+        colorWrite: false,
+        depthWrite: true,
+        depthTest: true,
+        blending: THREE.NoBlending,
+        uniforms: {
+            uHullCenter: { value: new THREE.Vector3(0, 0, -0.05) },
+            uHullScale: { value: 0.76 },
+        },
+    });
+}
+
+export function createOpenPoseMaterial() {
+    return new THREE.ShaderMaterial({
+        vertexShader: OPENPOSE_VERTEX,
+        fragmentShader: OPENPOSE_FRAGMENT,
+        side: THREE.DoubleSide,
+        depthTest: true,
+        depthWrite: true,
+        blending: THREE.NoBlending,
+    });
+}

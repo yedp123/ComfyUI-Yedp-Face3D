@@ -20,7 +20,7 @@ function makeBarButton(label, title = "") {
 }
 
 /**
- * Bottom-center shading mode switcher (`Textured | Clay | Wire | Normals | Depth | Smooth`).
+ * Bottom-center shading mode switcher (`Textured | Clay | Wire | Normals | Depth | Pose | Smooth`).
  */
 export function createMotionBar() {
     const bar = document.createElement("div");
@@ -43,6 +43,7 @@ export function createMotionBar() {
         { id: "wireframe", label: "Wire" },
         { id: "normals", label: "Normals" },
         { id: "depth", label: "Depth" },
+        { id: "pose", label: "Pose" },
     ];
 
     const modeButtons = {};

@@ -53,6 +53,7 @@ const UPPER_EYE_SET = new Set([
     ...LEFT_UPPER_LID, ...LEFT_UPPER_FOLD,
 ]);
 const LOWER_EYE_SET = new Set([...RIGHT_LOWER_LID, ...LEFT_LOWER_LID]);
+const PUPIL_SET = new Set([468, 469, 470, 471, 472, 473, 474, 475, 476, 477]);
 
 // Rigid nose ridge landmarks stay anchored to preserve character identity
 const NOSE_BONE_INDICES = new Set([168, 6, 197, 195, 5, 4, 1]);
@@ -76,6 +77,7 @@ function getSymmetryGroup(idx) {
     if (CORNER_LIP_SET.has(idx)) return 3;
     if (UPPER_EYE_SET.has(idx)) return 4;
     if (LOWER_EYE_SET.has(idx)) return 5;
+    if (PUPIL_SET.has(idx)) return 6;
     return 0;
 }
 
@@ -377,6 +379,10 @@ export class FaceRetargetRig {
                 cur[i] = eyes;
                 curX[i] = eyes;
                 seedKind[i] = 2;
+            } else if (PUPIL_SET.has(i)) {
+                cur[i] = eyes;
+                curX[i] = eyes;
+                seedKind[i] = 1;
             } else if (BROW_SET.has(i)) {
                 cur[i] = brows;
                 curX[i] = brows;
@@ -491,9 +497,17 @@ export class FaceRetargetRig {
                 const dy = Math.max(-maxStep, Math.min(maxStep, deltas[sOff + 1] * scaleY * w));
                 const dz = Math.max(-0.04, Math.min(0.04, deltas[sOff + 2] * scaleZ * w * cAtten));
 
-                this._tempDx[i] = dx;
-                this._tempDy[i] = dy;
-                this._tempDz[i] = dz;
+                if (PUPIL_SET.has(i)) {
+                    const maxGazeX = this.charEyeSpan * 0.09;
+                    const maxGazeY = this.charEyeSpan * 0.055;
+                    this._tempDx[i] = Math.max(-maxGazeX, Math.min(maxGazeX, dx));
+                    this._tempDy[i] = Math.max(-maxGazeY, Math.min(maxGazeY, dy));
+                    this._tempDz[i] = Math.max(-0.015, Math.min(0.015, dz));
+                } else {
+                    this._tempDx[i] = dx;
+                    this._tempDy[i] = dy;
+                    this._tempDz[i] = dz;
+                }
             }
 
             // 1 gentle edge-smoothing pass prevents isolated outlier vertex spikes

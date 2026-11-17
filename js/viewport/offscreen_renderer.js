@@ -72,9 +72,9 @@ async function postBinaryChunk(jobId, payload) {
 }
 
 /**
- * Render all batch frames offscreen across 4 synchronized geometry & color passes:
- * depth (1ch), normal (3ch), clay shaded (3ch) + mask alpha (1ch), and textured lit (3ch),
- * uploading lossless chunks directly to the backend ComfyUI job cache.
+ * Render all batch frames offscreen across 5 synchronized geometry, color & OpenPose passes:
+ * depth (1ch), normal (3ch), clay shaded (3ch) + mask alpha (1ch), textured lit (3ch),
+ * and unlit OpenPose Head+Face skeleton (3ch), uploading lossless chunks directly to ComfyUI.
  */
 export async function renderAndUploadPasses({
     jobId,
@@ -95,7 +95,7 @@ export async function renderAndUploadPasses({
     const w = Math.max(1, Math.floor(width));
     const h = Math.max(1, Math.floor(height));
     const nPx = w * h;
-    const frameStride = nPx * 11; // depth(1) + normal(3) + shaded(3) + textured(3) + mask(1)
+    const frameStride = nPx * 14; // depth(1) + normal(3) + shaded(3) + textured(3) + mask(1) + pose(3)
     const framesPerChunk = Math.max(1, Math.min(8, Math.floor((24 * 1024 * 1024) / frameStride)));
 
     const exportMode = renderState.exportMode || "turntable";
@@ -156,7 +156,7 @@ export async function renderAndUploadPasses({
         const offCam = buildOffscreenCamera(liveCamera, controlsTarget, renderState, w, h, keepLivePose);
         const activeMesh = reconstructedFace.hasMesh ? reconstructedFace : null;
 
-        reconstructedFace.applyRenderState(renderState);
+        reconstructedFace.applyRenderState({ ...renderState, poseOverlay: false });
 
         // Precompute stable Fixed depth range before looping frames
         let fixedDepthBounds = { near: 0.5, far: 3.0 };
@@ -212,6 +212,7 @@ export async function renderAndUploadPasses({
             const shadedOff = baseOff + nPx * 4;
             const texturedOff = baseOff + nPx * 7;
             const maskOff = baseOff + nPx * 10;
+            const poseOff = baseOff + nPx * 11;
 
             // 1. Depth Pass (unfiltered, background = 0)
             reconstructedFace.setViewMode("depth");
@@ -249,6 +250,21 @@ export async function renderAndUploadPasses({
             renderer.render(scene, offCam);
             renderer.readRenderTargetPixels(rtSmooth, 0, 0, w, h, readBuf);
             packRgb(readBuf, chunkBuf, texturedOff, nPx);
+
+            // 5. Unlit OpenPose Head + 70-Pt Face Pass (pure black background)
+            if (placeholderHead?.group && !activeMesh) {
+                placeholderHead.group.visible = false;
+            }
+            reconstructedFace.setViewMode("pose");
+            renderer.setRenderTarget(rtSmooth);
+            renderer.setClearColor(0x000000, 0.0);
+            renderer.clear();
+            renderer.render(scene, offCam);
+            renderer.readRenderTargetPixels(rtSmooth, 0, 0, w, h, readBuf);
+            packRgb(readBuf, chunkBuf, poseOff, nPx);
+            if (placeholderHead?.group && !activeMesh) {
+                placeholderHead.group.visible = prevPhVis;
+            }
 
             chunkFrames++;
             onProgress?.(f + 1, totalFrames);
@@ -290,6 +306,9 @@ export async function renderAndUploadPasses({
                 z: Boolean(renderState.flipZ),
             },
             mask_mode: renderState.maskMode,
+            pose_mode: renderState.poseMode || "head_face",
+            pose_dot_scale: Number(renderState.poseDotScale ?? 1.0),
+            pose_occlude: renderState.poseOcclude !== false,
         };
 
         const finishRes = await api.fetchApi(`/yedp_face3d/render_finish/${jobId}`, {
@@ -306,6 +325,7 @@ export async function renderAndUploadPasses({
         renderer.setRenderTarget(prevTarget);
         renderer.setClearColor(prevClearColor, prevClearAlpha);
         if (grid) grid.visible = prevGridVis;
+        reconstructedFace.applyRenderState(renderState);
         reconstructedFace.setViewMode(prevMode);
         reconstructedFace.group.position.copy(prevPos);
         reconstructedFace.group.rotation.copy(prevRot);
