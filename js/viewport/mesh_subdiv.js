@@ -5,7 +5,7 @@
  * with zero per-frame allocations.
  */
 export class MeshSubdivider {
-    constructor(nBaseVerts, baseIndices, baseUvs, smoothness = 0.65) {
+    constructor(nBaseVerts, baseIndices, baseUvs, smoothness = 0.65, baseFaceMask = null) {
         this.nBaseVerts = nBaseVerts;
         this.baseIndices = baseIndices;
         this.smoothness = smoothness;
@@ -46,15 +46,23 @@ export class MeshSubdivider {
         this.edgePairs = new Int32Array(edgePairs);
         this.subdivIndices = subdivIndices;
 
-        // Precompute interpolated UVs and reusable scratch buffers
+        // Precompute interpolated UVs, face-to-shell blend masks, and reusable scratch buffers
         this.subdivUvs = new Float32Array(this.totalVerts * 2);
         this.subdivUvs.set(baseUvs);
+        this.subdivFaceMask = new Float32Array(this.totalVerts);
+        if (baseFaceMask) {
+            this.subdivFaceMask.set(baseFaceMask);
+        } else {
+            this.subdivFaceMask.fill(1.0);
+        }
+
         for (let e = 0; e < this.edgePairs.length; e += 3) {
             const a = this.edgePairs[e];
             const b = this.edgePairs[e + 1];
             const m = this.edgePairs[e + 2];
             this.subdivUvs[m * 2] = 0.5 * (baseUvs[a * 2] + baseUvs[b * 2]);
             this.subdivUvs[m * 2 + 1] = 0.5 * (baseUvs[a * 2 + 1] + baseUvs[b * 2 + 1]);
+            this.subdivFaceMask[m] = 0.5 * (this.subdivFaceMask[a] + this.subdivFaceMask[b]);
         }
 
         this.baseNormals = new Float32Array(nBaseVerts * 3);

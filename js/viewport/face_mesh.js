@@ -7,17 +7,69 @@ import {
 import { FaceRetargetRig } from "../vision/retarget_rig.js";
 import { SculptRig } from "../vision/sculpt_rig.js";
 import { MeshSubdivider } from "./mesh_subdiv.js";
+import { fetchWeldedGlbMesh } from "./glb_loader.js";
+import { HeadShellRig } from "./head_shell_rig.js";
 
 const _worldCenter = new THREE.Vector3();
+const SKIN_SAMPLE_LANDMARKS = [50, 280, 117, 346, 151, 9, 195];
 
-function loadTextureFromDataUrl(dataUrl) {
+let _headShellRigPromise = null;
+
+function getHeadShellRig() {
+    if (!_headShellRigPromise) {
+        const glbUrl = new URL("../../assets/head_shell.glb", import.meta.url).href;
+        _headShellRigPromise = fetchWeldedGlbMesh(glbUrl)
+            .then(({ positions, indices }) => new HeadShellRig(positions, indices))
+            .catch((err) => {
+                console.warn("[YedpFace3D] Optional head_shell.glb not loaded:", err?.message || err);
+                return null;
+            });
+    }
+    return _headShellRigPromise;
+}
+
+function sampleMedianSkinColor(img, uvs) {
+    try {
+        const w = Math.min(img.naturalWidth || img.width || 256, 256);
+        const h = Math.min(img.naturalHeight || img.height || 256, 256);
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, w, h);
+
+        const rs = [];
+        const gs = [];
+        const bs = [];
+        for (const id of SKIN_SAMPLE_LANDMARKS) {
+            if (id * 2 + 1 >= uvs.length) continue;
+            const px = Math.max(0, Math.min(w - 1, Math.round(uvs[id * 2] * (w - 1))));
+            const py = Math.max(0, Math.min(h - 1, Math.round((1.0 - uvs[id * 2 + 1]) * (h - 1))));
+            const d = ctx.getImageData(px, py, 1, 1).data;
+            rs.push(d[0]);
+            gs.push(d[1]);
+            bs.push(d[2]);
+        }
+        if (!rs.length) return null;
+        const mid = Math.floor(rs.length / 2);
+        rs.sort((a, b) => a - b);
+        gs.sort((a, b) => a - b);
+        bs.sort((a, b) => a - b);
+        return [rs[mid] / 255, gs[mid] / 255, bs[mid] / 255];
+    } catch {
+        return null;
+    }
+}
+
+function loadTextureFromDataUrl(dataUrl, uvs) {
     return new Promise((resolve, reject) => {
         if (!dataUrl) {
-            resolve(null);
+            resolve({ tex: null, skinColor: null });
             return;
         }
         const img = new Image();
         img.onload = () => {
+            const skinColor = uvs ? sampleMedianSkinColor(img, uvs) : null;
             const tex = new THREE.Texture(img);
             tex.colorSpace = THREE.SRGBColorSpace;
             tex.flipY = true;
@@ -26,7 +78,7 @@ function loadTextureFromDataUrl(dataUrl) {
             tex.minFilter = THREE.LinearFilter;
             tex.magFilter = THREE.LinearFilter;
             tex.needsUpdate = true;
-            resolve(tex);
+            resolve({ tex, skinColor });
         };
         img.onerror = () => reject(new Error("Failed to load texture image."));
         img.src = dataUrl;
@@ -34,8 +86,8 @@ function loadTextureFromDataUrl(dataUrl) {
 }
 
 /**
- * Manages the reconstructed 478-vertex Three.js face mesh, sculpt push/pull rig,
- * intrinsic skull retargeting, optional 1-level Phong subdivision, view modes, and guides.
+ * Manages the reconstructed 478-vertex Three.js face mesh optionally welded to the
+ * 36-vertex-socketed `head_shell.glb`, sculpt rig, skull retargeting, and Phong subdivision.
  */
 export class ReconstructedFaceMesh {
     constructor() {
@@ -45,6 +97,7 @@ export class ReconstructedFaceMesh {
         this.geometry = new THREE.BufferGeometry();
         this.mesh = new THREE.Mesh(this.geometry, this.material);
 
+        // Legacy procedural guide meshes kept only as fallback when head_shell.glb is absent
         this.guidesGroup = new THREE.Group();
         this.guideMat = new THREE.MeshStandardMaterial({
             color: 0x64748b,
@@ -80,6 +133,17 @@ export class ReconstructedFaceMesh {
         this.baseUvs = null;
         this.restPositions = null;
         this.animScratch = null;
+        this.mergedPositions = null;
+        this.mergedUvs = null;
+        this.mergedFaceMask = null;
+        this.mergedIndices = null;
+        this.mergedScratch = null;
+        this.shellFitState = null;
+        this.faceIndicesCount = 0;
+        this.totalIndicesCount = 0;
+
+        this.shellRig = null;
+        this.shellFitState = null;
         this.sculptRig = null;
         this.morphRig = null;
         this.subdivider = null;
@@ -88,11 +152,19 @@ export class ReconstructedFaceMesh {
         this.sculptState = null;
         this.regionWeights = null;
         this.smoothEnabled = true;
+        this.guidesVisible = true;
         this.hasMesh = false;
         this.viewMode = "textured";
+
+        // Start warming the cached head_shell.glb fetch immediately in browser environments
+        if (typeof window !== "undefined" && typeof fetch === "function") {
+            getHeadShellRig().then((rig) => {
+                if (rig) this.shellRig = rig;
+            });
+        }
     }
 
-    async updateFromReconstruction(meshData, frontImageUrl) {
+    async updateFromReconstruction(meshData, frontImageUrl, overrideShellRig = undefined) {
         this.basePositions = new Float32Array(meshData.positions);
         this.baseIndices = meshData.indices;
         this.baseUvs = new Float32Array(meshData.uv_front);
@@ -101,51 +173,122 @@ export class ReconstructedFaceMesh {
         this.sculptRig = new SculptRig(this.basePositions, this.baseIndices);
         this.restPositions = this.sculptRig.evaluate(this.sculptState);
         this.morphRig = new FaceRetargetRig(this.restPositions, this.baseIndices, this.regionWeights);
-        this.subdivider = new MeshSubdivider(
-            Math.floor(this.basePositions.length / 3),
-            this.baseIndices,
-            this.baseUvs,
-            0.65
-        );
-        this.lastMotionFrame = null;
 
+        if (overrideShellRig !== undefined) {
+            this.shellRig = overrideShellRig;
+        } else if (!this.shellRig && typeof window !== "undefined" && typeof fetch === "function") {
+            this.shellRig = await getHeadShellRig();
+        }
+
+        if (this.shellRig) {
+            const merged = this.shellRig.buildMergedRestMesh(
+                this.restPositions,
+                this.baseIndices,
+                this.baseUvs
+            );
+            this.mergedPositions = merged.positions;
+            this.mergedUvs = merged.uvs;
+            this.mergedFaceMask = merged.faceMask;
+            this.mergedIndices = merged.indices;
+            this.mergedScratch = new Float32Array(merged.totalVerts * 3);
+            this.shellFitState = merged.fitState;
+            this.faceIndicesCount = merged.faceIndicesCount;
+            this.totalIndicesCount = merged.indices.length;
+            this.material.uniforms.uHasHeadShell.value = 1.0;
+
+            this.subdivider = new MeshSubdivider(
+                merged.totalVerts,
+                merged.indices,
+                merged.uvs,
+                0.65,
+                merged.faceMask
+            );
+        } else {
+            const nVerts = Math.floor(this.basePositions.length / 3);
+            this.mergedPositions = new Float32Array(this.restPositions);
+            this.mergedUvs = this.baseUvs;
+            this.mergedFaceMask = new Float32Array(nVerts).fill(1.0);
+            this.mergedIndices = this.baseIndices;
+            this.mergedScratch = new Float32Array(this.basePositions.length);
+            this.shellFitState = null;
+            this.faceIndicesCount = this.baseIndices.length;
+            this.totalIndicesCount = this.baseIndices.length;
+            this.material.uniforms.uHasHeadShell.value = 0.0;
+
+            this.subdivider = new MeshSubdivider(
+                nVerts,
+                this.baseIndices,
+                this.baseUvs,
+                0.65,
+                this.mergedFaceMask
+            );
+        }
+
+        this.lastMotionFrame = null;
         this.bindActiveTopology();
-        this.uploadPositions(this.restPositions);
+        this.uploadPositions(this.mergedPositions);
         this.geometry.computeBoundingSphere();
 
         await this.updateFrontTexture(frontImageUrl);
         this.updateGuideAnchors(meshData.anchors);
+        this.applyGuideVisibility();
         this.hasMesh = true;
     }
 
     bindActiveTopology() {
-        if (!this.basePositions || !this.subdivider) return;
+        if (!this.mergedPositions || !this.subdivider) return;
         if (this.smoothEnabled) {
             const posCopy = new Float32Array(this.subdivider.subdivPositions.length);
             const uvCopy = new Float32Array(this.subdivider.subdivUvs);
+            const maskCopy = new Float32Array(this.subdivider.subdivFaceMask);
             this.geometry.setAttribute("position", new THREE.BufferAttribute(posCopy, 3));
             this.geometry.setAttribute("uv", new THREE.BufferAttribute(uvCopy, 2));
+            this.geometry.setAttribute("aFaceMask", new THREE.BufferAttribute(maskCopy, 1));
             this.geometry.setIndex(this.subdivider.subdivIndices);
         } else {
-            const posCopy = new Float32Array(this.basePositions.length);
-            const uvCopy = new Float32Array(this.baseUvs);
+            const posCopy = new Float32Array(this.mergedPositions.length);
+            const uvCopy = new Float32Array(this.mergedUvs);
+            const maskCopy = new Float32Array(this.mergedFaceMask);
             this.geometry.setAttribute("position", new THREE.BufferAttribute(posCopy, 3));
             this.geometry.setAttribute("uv", new THREE.BufferAttribute(uvCopy, 2));
-            this.geometry.setIndex(this.baseIndices);
+            this.geometry.setAttribute("aFaceMask", new THREE.BufferAttribute(maskCopy, 1));
+            this.geometry.setIndex(this.mergedIndices);
         }
+        this.applyDrawRange();
     }
 
-    uploadPositions(basePos) {
+    applyDrawRange() {
+        if (!this.totalIndicesCount) return;
+        const mult = this.smoothEnabled ? 4 : 1;
+        const count = this.guidesVisible ? this.totalIndicesCount * mult : this.faceIndicesCount * mult;
+        this.geometry.setDrawRange(0, count);
+    }
+
+    applyGuideVisibility() {
+        this.guidesGroup.visible = !this.shellRig && this.guidesVisible;
+        this.applyDrawRange();
+    }
+
+    uploadPositions(mergedOrFacePos) {
         const posAttr = this.geometry.getAttribute("position");
         if (!posAttr) return;
         if (this.smoothEnabled && this.subdivider) {
-            const subdivPos = this.subdivider.evaluate(basePos);
+            const subdivPos = this.subdivider.evaluate(mergedOrFacePos);
             posAttr.array.set(subdivPos);
         } else {
-            posAttr.array.set(basePos);
+            posAttr.array.set(mergedOrFacePos);
         }
         posAttr.needsUpdate = true;
         this.geometry.computeVertexNormals();
+    }
+
+    uploadFaceFrame(facePos) {
+        if (this.shellRig && this.shellFitState && this.mergedScratch) {
+            this.shellRig.deformInto(facePos, this.shellFitState, this.mergedScratch);
+            this.uploadPositions(this.mergedScratch);
+        } else {
+            this.uploadPositions(facePos);
+        }
     }
 
     setSmoothEnabled(enabled) {
@@ -157,7 +300,7 @@ export class ReconstructedFaceMesh {
         if (this.lastMotionFrame) {
             this.applyMotionFrame(this.lastMotionFrame);
         } else {
-            this.uploadPositions(this.restPositions);
+            this.uploadFaceFrame(this.restPositions);
         }
     }
 
@@ -173,7 +316,7 @@ export class ReconstructedFaceMesh {
         if (this.lastMotionFrame) {
             this.applyMotionFrame(this.lastMotionFrame);
         } else {
-            this.uploadPositions(this.restPositions);
+            this.uploadFaceFrame(this.restPositions);
         }
     }
 
@@ -186,10 +329,18 @@ export class ReconstructedFaceMesh {
     }
 
     async updateFrontTexture(frontImageUrl) {
-        const frontTex = await loadTextureFromDataUrl(frontImageUrl);
+        const { tex, skinColor } = await loadTextureFromDataUrl(frontImageUrl, this.baseUvs);
         this.disposeTextures();
-        this.frontTexture = frontTex;
-        this.material.uniforms.uFrontTex.value = frontTex || this.fallbackTex;
+        this.frontTexture = tex;
+        this.material.uniforms.uFrontTex.value = tex || this.fallbackTex;
+        if (skinColor) {
+            this.material.uniforms.uSkinColor.value.setRGB(
+                skinColor[0],
+                skinColor[1],
+                skinColor[2],
+                THREE.SRGBColorSpace
+            );
+        }
     }
 
     updateGuideAnchors(anchors) {
@@ -214,7 +365,7 @@ export class ReconstructedFaceMesh {
         }
 
         this.morphRig.evaluate(motionFrame, this.animScratch);
-        this.uploadPositions(this.animScratch);
+        this.uploadFaceFrame(this.animScratch);
     }
 
     resetPose() {
@@ -222,7 +373,7 @@ export class ReconstructedFaceMesh {
         this.group.rotation.set(0, 0, 0);
         this.group.quaternion.identity();
         if (!this.hasMesh || !this.restPositions) return;
-        this.uploadPositions(this.restPositions);
+        this.uploadFaceFrame(this.restPositions);
     }
 
     setTurntableYaw(yawRad) {
@@ -292,7 +443,8 @@ export class ReconstructedFaceMesh {
     }
 
     setGuidesVisible(visible) {
-        this.guidesGroup.visible = Boolean(visible);
+        this.guidesVisible = Boolean(visible);
+        this.applyGuideVisibility();
     }
 
     disposeTextures() {
@@ -307,8 +459,10 @@ export class ReconstructedFaceMesh {
         this.disposeTextures();
         this.geometry.deleteAttribute("position");
         this.geometry.deleteAttribute("uv");
+        this.geometry.deleteAttribute("aFaceMask");
         this.geometry.deleteAttribute("normal");
         this.geometry.setIndex([]);
+        this.geometry.setDrawRange(0, Infinity);
         this.geometry.boundingSphere = null;
         this.geometry.boundingBox = null;
 
@@ -317,6 +471,15 @@ export class ReconstructedFaceMesh {
         this.baseUvs = null;
         this.restPositions = null;
         this.animScratch = null;
+        this.mergedPositions = null;
+        this.mergedUvs = null;
+        this.mergedFaceMask = null;
+        this.mergedIndices = null;
+        this.mergedScratch = null;
+        this.shellFitState = null;
+        this.faceIndicesCount = 0;
+        this.totalIndicesCount = 0;
+
         this.sculptRig = null;
         this.morphRig = null;
         this.subdivider = null;

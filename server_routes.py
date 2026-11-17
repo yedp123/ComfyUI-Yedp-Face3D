@@ -35,6 +35,7 @@ def register_static_routes(package_dir: Path) -> None:
     mount_specs: Iterable[tuple[str, Path]] = (
         (f"/extensions/{extension_name}/js", package_dir / "js"),
         (f"/extensions/{extension_name}/models", package_dir / "models"),
+        (f"/extensions/{extension_name}/assets", package_dir / "assets"),
     )
 
     for url_prefix, directory in mount_specs:

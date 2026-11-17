@@ -1,13 +1,17 @@
 import * as THREE from "../lib/three.module.js";
 
 const VERTEX_SHADER = /* glsl */ `
+    attribute float aFaceMask;
+
     varying vec2 vUv;
+    varying float vFaceMask;
     varying vec3 vWorldNormal;
     varying vec3 vViewNormal;
     varying float vViewDepth;
 
     void main() {
         vUv = uv;
+        vFaceMask = aFaceMask;
         vWorldNormal = normalize(mat3(modelMatrix) * normal);
         vViewNormal = normalize(normalMatrix * normal);
 
@@ -19,6 +23,8 @@ const VERTEX_SHADER = /* glsl */ `
 
 const FRAGMENT_SHADER = /* glsl */ `
     uniform sampler2D uFrontTex;
+    uniform vec3 uSkinColor;
+    uniform float uHasHeadShell;
     uniform int uViewMode;
     uniform float uDepthNear;
     uniform float uDepthFar;
@@ -32,6 +38,7 @@ const FRAGMENT_SHADER = /* glsl */ `
     uniform float uAmbientIntensity;
 
     varying vec2 vUv;
+    varying float vFaceMask;
     varying vec3 vWorldNormal;
     varying vec3 vViewNormal;
     varying float vViewDepth;
@@ -53,7 +60,10 @@ const FRAGMENT_SHADER = /* glsl */ `
             return;
         }
 
-        vec3 albedo = texture2D(uFrontTex, vUv).rgb;
+        vec3 texAlbedo = texture2D(uFrontTex, vUv).rgb;
+        vec3 albedo = uHasHeadShell > 0.5
+            ? mix(uSkinColor, texAlbedo, smoothstep(0.0, 0.85, vFaceMask))
+            : texAlbedo;
         vec3 n = normalize(vWorldNormal);
         float keyDiff = max(dot(n, normalize(uKeyDir)), 0.0);
         float rimDiff = max(dot(n, normalize(uRimDir)), 0.0);
@@ -103,6 +113,8 @@ export function createFaceMaterial(fallbackTex) {
         side: THREE.DoubleSide,
         uniforms: {
             uFrontTex: { value: fallbackTex },
+            uSkinColor: { value: new THREE.Color(0xd8b4a0).convertSRGBToLinear() },
+            uHasHeadShell: { value: 0.0 },
             uViewMode: { value: 0 },
             uDepthNear: { value: 1.4 },
             uDepthFar: { value: 2.3 },
