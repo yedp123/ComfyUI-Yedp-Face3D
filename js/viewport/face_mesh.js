@@ -11,6 +11,7 @@ import { MeshSubdivider } from "./mesh_subdiv.js";
 import { fetchWeldedGlbMesh, fetchOpenPoseRigGlb } from "./glb_loader.js";
 import { HeadShellRig } from "./head_shell_rig.js";
 import { OpenPoseFaceRig } from "./openpose_rig.js";
+import { EyeballRig } from "./eyeball_rig.js";
 
 const _worldCenter = new THREE.Vector3();
 const SKIN_SAMPLE_LANDMARKS = [50, 280, 117, 346, 151, 9, 195];
@@ -146,7 +147,8 @@ export class ReconstructedFaceMesh {
         this.depthHullMesh.visible = false;
         this.depthHullMesh.renderOrder = 0;
         this.depthHullMesh.frustumCulled = false;
-        this.group.add(this.depthHullMesh);
+        this.eyeballRig = new EyeballRig(this.material);
+        this.group.add(this.depthHullMesh, this.eyeballRig.group);
 
         this.frontTexture = null;
 
@@ -171,6 +173,8 @@ export class ReconstructedFaceMesh {
         this.morphRig = null;
         this.subdivider = null;
         this.lastMotionFrame = null;
+        this.latestActivePositions = null;
+        this.openPoseDirty = false;
 
         this.sculptState = null;
         this.regionWeights = null;
@@ -198,12 +202,7 @@ export class ReconstructedFaceMesh {
         if (!data || this.openPoseRig) return;
         this.openPoseRig = new OpenPoseFaceRig(data);
         this.group.add(this.openPoseRig.group);
-        if (this.hasMesh) {
-            const activePos = this.lastMotionFrame
-                ? (this.shellRig ? this.mergedScratch : this.animScratch)
-                : this.mergedPositions;
-            this.openPoseRig.updateFromPositions(activePos || this.mergedPositions, this.shellRig, this.guidesVisible);
-        }
+        this.openPoseDirty = true;
         this.syncPoseVisibility();
     }
 
@@ -216,6 +215,7 @@ export class ReconstructedFaceMesh {
         this.sculptRig = new SculptRig(this.basePositions, this.baseIndices);
         this.restPositions = this.sculptRig.evaluate(this.sculptState);
         this.morphRig = new FaceRetargetRig(this.restPositions, this.baseIndices, this.regionWeights);
+        this.eyeballRig.configureRest(this.restPositions, this.baseUvs);
 
         if (overrideShellRig !== undefined) {
             this.shellRig = overrideShellRig;
@@ -319,7 +319,11 @@ export class ReconstructedFaceMesh {
         const isPose = this.viewMode === "pose";
         this.guidesGroup.visible = !isPose && !this.shellRig && this.guidesVisible;
         this.applyDrawRange();
-        this.openPoseRig?.setOptions({ guidesVisible: this.guidesVisible });
+        if (this.openPoseRig && (isPose || this.poseOverlay)) {
+            this.openPoseRig.setOptions({ guidesVisible: this.guidesVisible });
+        } else {
+            this.openPoseDirty = true;
+        }
     }
 
     uploadPositions(mergedOrFacePos) {
@@ -333,16 +337,23 @@ export class ReconstructedFaceMesh {
         }
         posAttr.needsUpdate = true;
         this.geometry.computeVertexNormals();
+        this.latestActivePositions = mergedOrFacePos;
+        this.eyeballRig.updateFromPositions(mergedOrFacePos);
 
-        if (mergedOrFacePos.length >= 455 * 3) {
-            const spanX = Math.max(Math.abs(mergedOrFacePos[454 * 3] - mergedOrFacePos[234 * 3]), 0.1);
-            const cx = 0.5 * (mergedOrFacePos[234 * 3] + mergedOrFacePos[454 * 3]);
-            const cy = 0.5 * (mergedOrFacePos[10 * 3 + 1] + mergedOrFacePos[152 * 3 + 1]);
-            const czTemple = 0.5 * (mergedOrFacePos[234 * 3 + 2] + mergedOrFacePos[454 * 3 + 2]);
-            const cz = czTemple - (this.guidesVisible && this.shellRig ? 0.14 : 0.18) * spanX;
-            this.depthHullMaterial.uniforms.uHullCenter.value.set(cx, cy, cz);
+        if (this.openPoseRig && (this.viewMode === "pose" || this.poseOverlay)) {
+            if (mergedOrFacePos.length >= 455 * 3) {
+                const spanX = Math.max(Math.abs(mergedOrFacePos[454 * 3] - mergedOrFacePos[234 * 3]), 0.1);
+                const cx = 0.5 * (mergedOrFacePos[234 * 3] + mergedOrFacePos[454 * 3]);
+                const cy = 0.5 * (mergedOrFacePos[10 * 3 + 1] + mergedOrFacePos[152 * 3 + 1]);
+                const czTemple = 0.5 * (mergedOrFacePos[234 * 3 + 2] + mergedOrFacePos[454 * 3 + 2]);
+                const cz = czTemple - (this.guidesVisible && this.shellRig ? 0.14 : 0.18) * spanX;
+                this.depthHullMaterial.uniforms.uHullCenter.value.set(cx, cy, cz);
+            }
+            this.openPoseRig.updateFromPositions(mergedOrFacePos, this.shellRig, this.guidesVisible);
+            this.openPoseDirty = false;
+        } else {
+            this.openPoseDirty = true;
         }
-        this.openPoseRig?.updateFromPositions(mergedOrFacePos, this.shellRig, this.guidesVisible);
     }
 
     uploadFaceFrame(facePos) {
@@ -371,6 +382,7 @@ export class ReconstructedFaceMesh {
         this.sculptState = { ...sculptState };
         if (!this.hasMesh || !this.sculptRig) return;
         this.restPositions = this.sculptRig.evaluate(this.sculptState);
+        this.eyeballRig.configureRest(this.restPositions, this.baseUvs);
         if (this.morphRig) {
             this.morphRig.updateRestPositions(this.restPositions);
         } else {
@@ -512,18 +524,35 @@ export class ReconstructedFaceMesh {
     syncPoseVisibility() {
         const isPose = this.viewMode === "pose";
         this.mesh.visible = !isPose;
+        this.eyeballRig.group.visible = !isPose && this.hasMesh;
         this.guidesGroup.visible = !isPose && !this.shellRig && this.guidesVisible;
         this.depthHullMesh.visible = isPose && this.hasMesh && this.poseOcclude;
 
         if (this.openPoseRig) {
-            this.openPoseRig.group.visible = this.hasMesh && (isPose || this.poseOverlay);
-            this.openPoseRig.setOptions({
-                poseMode: this.poseMode,
-                dotScale: this.poseDotScale,
-                occlude: this.poseOcclude,
-                guidesVisible: this.guidesVisible,
-                overlay: !isPose && this.poseOverlay,
-            });
+            const needPose = this.hasMesh && (isPose || this.poseOverlay);
+            this.openPoseRig.group.visible = needPose;
+            if (needPose && this.openPoseDirty && this.latestActivePositions) {
+                if (this.latestActivePositions.length >= 455 * 3) {
+                    const p = this.latestActivePositions;
+                    const spanX = Math.max(Math.abs(p[454 * 3] - p[234 * 3]), 0.1);
+                    const cx = 0.5 * (p[234 * 3] + p[454 * 3]);
+                    const cy = 0.5 * (p[10 * 3 + 1] + p[152 * 3 + 1]);
+                    const czTemple = 0.5 * (p[234 * 3 + 2] + p[454 * 3 + 2]);
+                    const cz = czTemple - (this.guidesVisible && this.shellRig ? 0.14 : 0.18) * spanX;
+                    this.depthHullMaterial.uniforms.uHullCenter.value.set(cx, cy, cz);
+                }
+                this.openPoseRig.updateFromPositions(this.latestActivePositions, this.shellRig, this.guidesVisible);
+                this.openPoseDirty = false;
+            }
+            if (needPose) {
+                this.openPoseRig.setOptions({
+                    poseMode: this.poseMode,
+                    dotScale: this.poseDotScale,
+                    occlude: this.poseOcclude,
+                    guidesVisible: this.guidesVisible,
+                    overlay: !isPose && this.poseOverlay,
+                });
+            }
         }
     }
 
@@ -642,6 +671,8 @@ export class ReconstructedFaceMesh {
         this.morphRig = null;
         this.subdivider = null;
         this.lastMotionFrame = null;
+        this.latestActivePositions = null;
+        this.openPoseDirty = false;
         if (resetParams) {
             this.sculptState = null;
             this.regionWeights = null;
@@ -649,6 +680,7 @@ export class ReconstructedFaceMesh {
         this.group.rotation.set(0, 0, 0);
         this.group.quaternion.identity();
         this.hasMesh = false;
+        this.eyeballRig.clear();
         this.syncPoseVisibility();
     }
 
@@ -658,6 +690,7 @@ export class ReconstructedFaceMesh {
         this.geometry.dispose();
         this.material.dispose();
         this.depthHullMaterial.dispose();
+        this.eyeballRig.dispose();
         this.openPoseRig?.dispose();
         this.neckGeo.dispose();
         this.earGeo.dispose();

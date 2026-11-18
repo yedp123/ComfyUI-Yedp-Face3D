@@ -23,7 +23,6 @@ export function createViewportDOM(handlers) {
         onRenderChange,
         onFitHead,
         onSelectRefFile,
-        onRemoveRefView,
         onResetAll,
         onStatusError,
     } = handlers;
@@ -82,7 +81,6 @@ export function createViewportDOM(handlers) {
     // 1. Left reference stack (front, three-quarter, side, RESET)
     const refStack = createRefStackPanel({
         onSelectFile: onSelectRefFile,
-        onRemoveView: onRemoveRefView,
         onResetAll,
         onError: onStatusError,
     });

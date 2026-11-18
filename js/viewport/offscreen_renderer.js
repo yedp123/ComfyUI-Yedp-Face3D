@@ -86,6 +86,7 @@ export async function renderAndUploadPasses({
     reconstructedFace,
     placeholderHead,
     motionClip,
+    snapshotFrame = null,
     turntableFrames,
     renderState,
     width,
@@ -96,7 +97,7 @@ export async function renderAndUploadPasses({
     const h = Math.max(1, Math.floor(height));
     const nPx = w * h;
     const frameStride = nPx * 14; // depth(1) + normal(3) + shaded(3) + textured(3) + mask(1) + pose(3)
-    const framesPerChunk = Math.max(1, Math.min(8, Math.floor((24 * 1024 * 1024) / frameStride)));
+    const framesPerChunk = Math.max(1, Math.min(4, Math.floor((12 * 1024 * 1024) / frameStride)));
 
     const exportMode = renderState.exportMode || "turntable";
     const hasClip = Array.isArray(motionClip) && motionClip.length > 0 && reconstructedFace.hasMesh;
@@ -158,12 +159,16 @@ export async function renderAndUploadPasses({
 
         reconstructedFace.applyRenderState({ ...renderState, poseOverlay: false });
 
-        // Precompute stable Fixed depth range before looping frames
+        // Precompute static pose & Fixed depth range ONCE before the loop (eliminates redundant per-angle skinning/subdiv)
         let fixedDepthBounds = { near: 0.5, far: 3.0 };
-        if (activeMesh && !dynamicDepth) {
-            if (!isSingle) {
+        if (activeMesh && !useClip && !isSingle) {
+            if (snapshotFrame) {
+                reconstructedFace.applyMotionFrame(snapshotFrame);
+            } else {
                 reconstructedFace.resetPose();
             }
+        }
+        if (activeMesh && !dynamicDepth) {
             fixedDepthBounds = reconstructedFace.updateDepthBounds(offCam, false) || fixedDepthBounds;
         }
 
@@ -187,7 +192,6 @@ export async function renderAndUploadPasses({
                 if (useClip) {
                     reconstructedFace.applyMotionFrame(motionClip[f]);
                 } else if (!isSingle) {
-                    reconstructedFace.resetPose();
                     reconstructedFace.setTurntableYaw(THREE.MathUtils.degToRad(yawDeg));
                 }
                 if (dynamicDepth) {
@@ -279,6 +283,11 @@ export async function renderAndUploadPasses({
                 chunkStartFrame += chunkFrames;
                 chunkFrames = 0;
             }
+
+            if (totalFrames > 1 && f + 1 < totalFrames) {
+                // Yield between WebGL readPixels stalls so Windows DWM and browser UI stay responsive
+                await new Promise((resolve) => setTimeout(resolve, 0));
+            }
         }
 
         if (!Number.isFinite(depthRangeLog.near) || !Number.isFinite(depthRangeLog.far)) {
@@ -286,12 +295,18 @@ export async function renderAndUploadPasses({
             depthRangeLog.far = fixedDepthBounds.far;
         }
 
+        const motionSource = useClip
+            ? "mocap_clip"
+            : snapshotFrame
+                ? (isSingle ? "snapshot_single" : "snapshot_turntable")
+                : (isSingle ? "single_frame" : "turntable");
+
         const metadata = {
             export_mode: exportMode,
             projection: renderState.projection,
             resolution: [w, h],
             frame_count: totalFrames,
-            motion_source: useClip ? "mocap_clip" : isSingle ? "single_frame" : "turntable",
+            motion_source: motionSource,
             has_reconstructed_face: Boolean(activeMesh),
             has_head_shell: Boolean(reconstructedFace.shellRig),
             geometry_mode: reconstructedFace.guidesVisible ? "head_neck" : "face_only",
@@ -327,14 +342,14 @@ export async function renderAndUploadPasses({
         if (grid) grid.visible = prevGridVis;
         reconstructedFace.applyRenderState(renderState);
         reconstructedFace.setViewMode(prevMode);
-        reconstructedFace.group.position.copy(prevPos);
-        reconstructedFace.group.rotation.copy(prevRot);
-        reconstructedFace.group.quaternion.copy(prevQuat);
         if (prevLastMotion) {
             reconstructedFace.applyMotionFrame(prevLastMotion);
         } else if (reconstructedFace.hasMesh && reconstructedFace.restPositions) {
             reconstructedFace.uploadFaceFrame(reconstructedFace.restPositions);
         }
+        reconstructedFace.group.position.copy(prevPos);
+        reconstructedFace.group.rotation.copy(prevRot);
+        reconstructedFace.group.quaternion.copy(prevQuat);
         if (placeholderHead?.group) {
             placeholderHead.group.visible = prevPhVis;
             if (prevPhRot) placeholderHead.group.rotation.copy(prevPhRot);

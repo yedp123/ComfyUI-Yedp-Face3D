@@ -3,6 +3,7 @@ import base64
 import io as py_io
 import json
 import math
+import uuid
 import numpy as np
 from PIL import Image
 import torch
@@ -96,7 +97,7 @@ def unpack_render_job_tensors(
 
     inv255 = np.float32(1.0 / 255.0)
     for b, f_idx in enumerate(frame_indices):
-        raw = frames_dict[f_idx]
+        raw = frames_dict.pop(f_idx)
         # Flip vertical scanlines (WebGL readPixels is bottom-up, ComfyUI IMAGE is top-down)
         d = np.frombuffer(raw, dtype=np.uint8, count=n_px, offset=0).reshape(h, w)[::-1]
         depth_np[b, :, :, :] = (d.astype(np.float32) * inv255)[:, :, None]
@@ -350,6 +351,12 @@ class YedpFace3D(io.ComfyNode):
             ],
             hidden=[io.Hidden.unique_id],
         )
+
+    @classmethod
+    def fingerprint_inputs(cls, **kwargs) -> str:
+        # 3D camera, sculpt, render toggles, snapshots, and stacked refs live in the browser UI,
+        # so return a fresh fingerprint per run so ComfyUI never serves stale cached passes.
+        return uuid.uuid4().hex
 
     @classmethod
     async def execute(

@@ -43,23 +43,43 @@ export function createMocapPanel(webcamOverlay) {
     Object.assign(webcamRow.style, { display: "flex", gap: "4px", alignItems: "center" });
 
     const webcamBtn = makePanelButton("Webcam", "Toggle live CPU webcam face tracking");
-    const recordBtn = makePanelButton("Rec", "Record webcam expression + head pose clip");
-    recordBtn.style.display = "none";
     const calibrateBtn = makePanelButton("Calibrate", "Set current webcam expression as neutral");
     calibrateBtn.style.display = "none";
 
-    webcamRow.append(webcamBtn, recordBtn, calibrateBtn);
+    webcamRow.append(webcamBtn, calibrateBtn);
+
+    const captureRow = document.createElement("div");
+    Object.assign(captureRow.style, { display: "none", gap: "4px", alignItems: "center" });
+
+    const recordBtn = makePanelButton("Rec", "Record multi-frame webcam expression + head pose clip");
+    const snapBtn = makePanelButton("Snap", "Capture current single expression + angle snapshot and stop webcam");
+    const snapTimedBtn = makePanelButton("3s", "3-second delayed expression + angle snapshot");
+    snapTimedBtn.style.flex = "0 0 auto";
+    snapTimedBtn.style.padding = "4px 7px";
+
+    captureRow.append(recordBtn, snapBtn, snapTimedBtn);
+
+    const snapshotRow = document.createElement("div");
+    Object.assign(snapshotRow.style, { display: "none", gap: "4px", alignItems: "center" });
+
+    const snapToggleBtn = makePanelButton("Snap: ON", "Toggle between saved snapshot expression and neutral rest pose");
+    const snapAngleBtn = makePanelButton("Snap Angle", "Restore camera angle captured at snapshot time");
+    snapAngleBtn.style.flex = "0 0 auto";
+    const clearSnapBtn = makePanelButton("×", "Clear snapshot from memory and reset pose");
+    clearSnapBtn.style.flex = "0 0 auto";
+    clearSnapBtn.style.padding = "4px 8px";
+    clearSnapBtn.style.color = "#fca5a5";
+
+    snapshotRow.append(snapToggleBtn, snapAngleBtn, clearSnapBtn);
 
     const playbackRow = document.createElement("div");
-    Object.assign(playbackRow.style, { display: "flex", gap: "4px", alignItems: "center" });
+    Object.assign(playbackRow.style, { display: "none", gap: "4px", alignItems: "center" });
 
     const playClipBtn = makePanelButton("Play Clip", "Play recorded webcam or driving video clip");
-    playClipBtn.style.display = "none";
     const clearClipBtn = makePanelButton("×", "Clear recorded motion clip");
     clearClipBtn.style.flex = "0 0 auto";
     clearClipBtn.style.padding = "4px 8px";
     clearClipBtn.style.color = "#fca5a5";
-    clearClipBtn.style.display = "none";
 
     playbackRow.append(playClipBtn, clearClipBtn);
 
@@ -71,13 +91,21 @@ export function createMocapPanel(webcamOverlay) {
         minHeight: "12px",
     });
 
-    panel.append(webcamOverlay.element, webcamRow, playbackRow, motionStatus);
+    panel.append(webcamOverlay.element, webcamRow, captureRow, snapshotRow, playbackRow, motionStatus);
 
     return {
         panel,
         webcamBtn,
-        recordBtn,
         calibrateBtn,
+        captureRow,
+        recordBtn,
+        snapBtn,
+        snapTimedBtn,
+        snapshotRow,
+        snapToggleBtn,
+        snapAngleBtn,
+        clearSnapBtn,
+        playbackRow,
         playClipBtn,
         clearClipBtn,
         motionStatus,

@@ -6,6 +6,8 @@
  * - EAR-fused eyelid blink closure
  */
 
+import { EYE_SPECS, fitEyeSocket, clampEyelidsOverEyeball } from "../viewport/eyeball_rig.js";
+
 const NOSE_BRIDGE_IDX = 168;
 const CHIN_IDX = 152;
 const LEFT_EYE_OUTER_IDX = 33;
@@ -155,6 +157,8 @@ function buildEyeRig(pos, upperIds, upperFoldIds, lowerIds, outerIdx, innerIdx) 
     const isLidMask = new Uint8Array(n);
 
     for (let i = 0; i < n; i++) {
+        // Keep medial/lateral eye corners anchored during blink weights (deltas still track expressions)
+        if (i === outerIdx || i === innerIdx) continue;
         const vx = pos[i * 3];
         const vy = pos[i * 3 + 1];
         const dx = Math.abs(vx - cx) / halfW;
@@ -319,6 +323,10 @@ export class FaceRetargetRig {
 
         this.eyeRight = buildEyeRig(this.rest, RIGHT_UPPER_LID, RIGHT_UPPER_FOLD, RIGHT_LOWER_LID, 33, 133);
         this.eyeLeft = buildEyeRig(this.rest, LEFT_UPPER_LID, LEFT_UPPER_FOLD, LEFT_LOWER_LID, 263, 362);
+        this.rightEyeSocket = fitEyeSocket(this.rest, EYE_SPECS[0]);
+        this.leftEyeSocket = fitEyeSocket(this.rest, EYE_SPECS[1]);
+        this.rightEyeWrapIds = [...RIGHT_UPPER_LID, ...RIGHT_UPPER_FOLD, ...RIGHT_LOWER_LID];
+        this.leftEyeWrapIds = [...LEFT_UPPER_LID, ...LEFT_UPPER_FOLD, ...LEFT_LOWER_LID];
         this.lipRound = buildLipRoundRig(this.rest, this.neighbors);
 
         this.eyeLineY = 0.5 * (eyeL[1] + eyeR[1]);
@@ -591,6 +599,36 @@ export class FaceRetargetRig {
                     outArray[yOff] += (blinkL * 0.26 + squintL * 0.40) * this.eyeLeft.lidGap * lLo;
                 }
             }
+
+            // Guarantee full column-by-column lid sealing at full blink before spherical wrapping
+            const sealPairs = (upperIds, lowerIds, blinkVal, lidGap) => {
+                if (blinkVal < 0.45) return;
+                const seal = smoothstep(0.45, 0.96, blinkVal);
+                const overlap = 0.05 * lidGap;
+                for (let k = 0; k < upperIds.length; k++) {
+                    const uY = upperIds[k] * 3 + 1;
+                    const lY = lowerIds[k] * 3 + 1;
+                    const maxUpperY = outArray[lY] - overlap;
+                    if (outArray[uY] > maxUpperY) {
+                        outArray[uY] += (maxUpperY - outArray[uY]) * seal;
+                    }
+                }
+            };
+            sealPairs(RIGHT_UPPER_LID, RIGHT_LOWER_LID, blinkR, this.eyeRight.lidGap);
+            sealPairs(LEFT_UPPER_LID, LEFT_LOWER_LID, blinkL, this.eyeLeft.lidGap);
         }
+
+        // Arc eyelid & fold vertices smoothly forward (+Z) over each eyeball dome to eliminate poke-through
+        const wrapEye = (socket, spec, wrapIds) => {
+            if (!socket) return;
+            const outO = spec.outerIdx * 3;
+            const inO = spec.innerIdx * 3;
+            const cx = socket.cx + (0.5 * (outArray[outO] + outArray[inO]) - socket.cornerMidX);
+            const cy = socket.cy + (0.5 * (outArray[outO + 1] + outArray[inO + 1]) - socket.cornerMidY);
+            const cz = socket.cz + (0.5 * (outArray[outO + 2] + outArray[inO + 2]) - socket.cornerMidZ);
+            clampEyelidsOverEyeball(outArray, socket, wrapIds, cx, cy, cz);
+        };
+        wrapEye(this.rightEyeSocket, EYE_SPECS[0], this.rightEyeWrapIds);
+        wrapEye(this.leftEyeSocket, EYE_SPECS[1], this.leftEyeWrapIds);
     }
 }

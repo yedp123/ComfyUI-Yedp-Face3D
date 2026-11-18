@@ -83,10 +83,15 @@ export function createSculptPanel(onChange) {
     addSlider("Cheeks", "cheeks");
     addSlider("Jaw Width", "jawWidth");
 
-    const reset = (notify = true) => {
-        Object.assign(state, DEFAULT_SCULPT_STATE);
+    const setState = (partial, notify = false) => {
+        if (!partial) return;
+        Object.assign(state, partial);
         for (const s of setters) s();
         if (notify) onChange({ ...state });
+    };
+
+    const reset = (notify = true) => {
+        setState(DEFAULT_SCULPT_STATE, notify);
     };
 
     const resetBtn = document.createElement("button");
@@ -112,6 +117,7 @@ export function createSculptPanel(onChange) {
     return {
         panel,
         getState: () => ({ ...state }),
+        setState,
         reset,
     };
 }

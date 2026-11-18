@@ -17,9 +17,9 @@ function readFileAsDataUrl(file) {
 
 /**
  * Left-side vertical stack of portrait import/preview slots (`front`, `three-quarter`, `side`)
- * with per-card delete (`×`) badges and a prominent full-reset `RESET` button.
+ * and a prominent full-reset `RESET` button.
  */
-export function createRefStackPanel({ onSelectFile, onRemoveView, onResetAll, onError }) {
+export function createRefStackPanel({ onSelectFile, onResetAll, onError }) {
     const column = document.createElement("div");
     Object.assign(column.style, {
         display: "flex",
@@ -84,30 +84,6 @@ export function createRefStackPanel({ onSelectFile, onRemoveView, onResetAll, on
             display: "none",
         });
 
-        const removeBtn = document.createElement("button");
-        removeBtn.type = "button";
-        removeBtn.title = `Remove ${label}`;
-        Object.assign(removeBtn.style, {
-            position: "absolute",
-            top: "3px",
-            right: "3px",
-            width: "18px",
-            height: "18px",
-            borderRadius: "999px",
-            border: "1px solid rgba(255, 255, 255, 0.25)",
-            backgroundColor: "rgba(220, 38, 38, 0.92)",
-            color: "#ffffff",
-            display: "none",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: "0",
-            cursor: "pointer",
-            boxShadow: "0 2px 6px rgba(0, 0, 0, 0.55)",
-            zIndex: "2",
-        });
-        removeBtn.appendChild(createSvgIcon("close", 11, "#ffffff"));
-        stopViewportEvents(removeBtn);
-
         const input = document.createElement("input");
         input.type = "file";
         input.accept = "image/*";
@@ -123,7 +99,7 @@ export function createRefStackPanel({ onSelectFile, onRemoveView, onResetAll, on
             try {
                 const dataUrl = await readFileAsDataUrl(file);
                 setPreview(key, dataUrl);
-                await onSelectFile(key, dataUrl);
+                await onSelectFile(key, dataUrl, file);
             } catch (err) {
                 onError?.(`Error: ${err.message}`);
             }
@@ -142,7 +118,7 @@ export function createRefStackPanel({ onSelectFile, onRemoveView, onResetAll, on
         });
         card.addEventListener("dragleave", (e) => {
             e.stopPropagation();
-            card.style.borderColor = removeBtn.style.display === "flex"
+            card.style.borderColor = thumb.style.display === "block"
                 ? "rgba(255, 255, 255, 0.28)"
                 : "rgba(255, 255, 255, 0.14)";
         });
@@ -155,17 +131,11 @@ export function createRefStackPanel({ onSelectFile, onRemoveView, onResetAll, on
             }
         });
 
-        removeBtn.addEventListener("click", (e) => {
-            e.stopPropagation();
-            setPreview(key, null);
-            onRemoveView(key);
-        });
-
-        card.append(uploadIcon, thumb, removeBtn, input);
+        card.append(uploadIcon, thumb, input);
         item.append(caption, card);
         column.appendChild(item);
 
-        slots[key] = { card, uploadIcon, thumb, removeBtn };
+        slots[key] = { card, uploadIcon, thumb };
     }
 
     const resetAllBtn = document.createElement("button");
@@ -199,13 +169,11 @@ export function createRefStackPanel({ onSelectFile, onRemoveView, onResetAll, on
             slot.thumb.src = dataUrl;
             slot.thumb.style.display = "block";
             slot.uploadIcon.style.display = "none";
-            slot.removeBtn.style.display = "flex";
             slot.card.style.borderColor = active ? "#38bdf8" : "rgba(255, 255, 255, 0.28)";
         } else {
             slot.thumb.removeAttribute("src");
             slot.thumb.style.display = "none";
             slot.uploadIcon.style.display = "block";
-            slot.removeBtn.style.display = "none";
             slot.card.style.borderColor = "rgba(255, 255, 255, 0.14)";
         }
     }

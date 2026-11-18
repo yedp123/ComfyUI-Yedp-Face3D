@@ -119,10 +119,15 @@ export function createLightPanel(onChange) {
     addSection("Environment");
     addSlider("Ambient", "ambientIntensity", 0, 1.2, 0.05);
 
-    const reset = (notify = true) => {
-        Object.assign(state, DEFAULT_LIGHT_STATE);
+    const setState = (partial, notify = false) => {
+        if (!partial) return;
+        Object.assign(state, partial);
         for (const s of setters) s();
         if (notify) onChange({ ...state });
+    };
+
+    const reset = (notify = true) => {
+        setState(DEFAULT_LIGHT_STATE, notify);
     };
 
     const resetBtn = document.createElement("button");
@@ -148,6 +153,7 @@ export function createLightPanel(onChange) {
     return {
         panel,
         getState: () => ({ ...state }),
+        setState,
         reset,
     };
 }

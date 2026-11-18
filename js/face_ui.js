@@ -13,12 +13,35 @@ function matchesNodeId(eventNodeId, localNodeId) {
     return raw === local || raw.split(":").pop() === local;
 }
 
-function bindNodeWidgets(node, viewport) {
+function syncNodeWidgets(node, viewport) {
     const getWidget = (name) => node.widgets?.find((w) => w.name === name);
 
     const guidesWidget = getWidget("anatomical_guides");
     if (guidesWidget) {
         viewport.setGuidesVisible(guidesWidget.value ?? true);
+    }
+
+    const depthWidget = getWidget("depth_weight");
+    if (depthWidget) {
+        viewport.depthWeight = Number(depthWidget.value ?? 1.0);
+    }
+
+    const turntableWidget = getWidget("turntable_frames");
+    if (turntableWidget) {
+        viewport.setTurntableFrames(turntableWidget.value ?? 24);
+    }
+
+    const widthWidget = getWidget("render_width");
+    const heightWidget = getWidget("render_height");
+    viewport.setOutputResolution(widthWidget?.value ?? 512, heightWidget?.value ?? 512);
+}
+
+function bindNodeWidgets(node, viewport) {
+    const getWidget = (name) => node.widgets?.find((w) => w.name === name);
+    syncNodeWidgets(node, viewport);
+
+    const guidesWidget = getWidget("anatomical_guides");
+    if (guidesWidget) {
         viewport.onGuidesChanged = (visible) => {
             guidesWidget.value = visible;
             node.setDirtyCanvas?.(true, false);
@@ -32,7 +55,6 @@ function bindNodeWidgets(node, viewport) {
 
     const depthWidget = getWidget("depth_weight");
     if (depthWidget) {
-        viewport.depthWeight = Number(depthWidget.value ?? 1.0);
         const origCallback = depthWidget.callback;
         depthWidget.callback = function (value) {
             origCallback?.apply(this, arguments);
@@ -42,7 +64,6 @@ function bindNodeWidgets(node, viewport) {
 
     const turntableWidget = getWidget("turntable_frames");
     if (turntableWidget) {
-        viewport.setTurntableFrames(turntableWidget.value ?? 24);
         const origCallback = turntableWidget.callback;
         turntableWidget.callback = function (value) {
             origCallback?.apply(this, arguments);
@@ -55,7 +76,6 @@ function bindNodeWidgets(node, viewport) {
     const syncOutputDims = () => {
         viewport.setOutputResolution(widthWidget?.value ?? 512, heightWidget?.value ?? 512);
     };
-    syncOutputDims();
 
     for (const dimWidget of [widthWidget, heightWidget]) {
         if (!dimWidget) continue;
@@ -85,8 +105,7 @@ app.registerExtension({
                 onSculptChange: (sculptState) => viewport?.updateSculpt(sculptState),
                 onRenderChange: (renderState, changedKey) => viewport?.updateRenderSettings(renderState, changedKey),
                 onFitHead: (renderState) => viewport?.fitHeadToView(renderState),
-                onSelectRefFile: (viewKey, dataUrl) => viewport?.loadSingleReference(viewKey, dataUrl),
-                onRemoveRefView: (viewKey) => viewport?.removeReference(viewKey),
+                onSelectRefFile: (viewKey, dataUrl, file) => viewport?.loadSingleReference(viewKey, dataUrl, file),
                 onResetAll: () => viewport?.clearAllReferences(),
                 onStatusError: (msg) => viewport?.setStatus(msg, true),
             });
@@ -119,6 +138,9 @@ app.registerExtension({
                 api.removeEventListener("yedp_face3d_sync_refs", onSyncRefs);
                 api.removeEventListener("yedp_face3d_render_job", onRenderJob);
                 viewport.dispose();
+                if (this._yedpFaceViewport === viewport) {
+                    this._yedpFaceViewport = null;
+                }
             };
 
             const origWidgetRemove = domWidget.onRemove;
@@ -135,6 +157,27 @@ app.registerExtension({
 
             this.setSize([780, 700]);
             return result;
+        };
+
+        const origOnSerialize = nodeType.prototype.onSerialize;
+        nodeType.prototype.onSerialize = function (o) {
+            origOnSerialize?.apply(this, arguments);
+            if (!this._yedpFaceViewport || !o || typeof o !== "object") return;
+            o.properties = o.properties || {};
+            o.properties.yedp_face3d_state = this._yedpFaceViewport.exportSerializableState();
+        };
+
+        const origOnConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            const res = origOnConfigure ? origOnConfigure.apply(this, arguments) : undefined;
+            if (this._yedpFaceViewport) {
+                syncNodeWidgets(this, this._yedpFaceViewport);
+                const saved = info?.properties?.yedp_face3d_state ?? this.properties?.yedp_face3d_state;
+                if (saved) {
+                    this._yedpFaceViewport.restoreSerializableState(saved);
+                }
+            }
+            return res;
         };
     },
 });

@@ -11,7 +11,7 @@ from .face_math import reconstruct_face_mesh
 
 _REGISTERED_EXTENSIONS: set[str] = set()
 _DRIVING_BATCH_CACHE: dict[str, list[str]] = {}
-_MAX_CACHED_BATCHES = 4
+_MAX_CACHED_BATCHES = 2
 
 _RENDER_JOBS_LOCK = threading.Lock()
 _RENDER_JOBS: dict[str, dict] = {}

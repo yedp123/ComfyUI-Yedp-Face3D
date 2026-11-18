@@ -85,10 +85,15 @@ export function createWeightPanel(onChange) {
     });
     panel.appendChild(note);
 
-    const reset = (notify = true) => {
-        Object.assign(state, DEFAULT_WEIGHT_STATE);
+    const setState = (partial, notify = false) => {
+        if (!partial) return;
+        Object.assign(state, partial);
         for (const s of setters) s();
         if (notify) onChange({ ...state });
+    };
+
+    const reset = (notify = true) => {
+        setState(DEFAULT_WEIGHT_STATE, notify);
     };
 
     const resetBtn = document.createElement("button");
@@ -114,6 +119,7 @@ export function createWeightPanel(onChange) {
     return {
         panel,
         getState: () => ({ ...state }),
+        setState,
         reset,
     };
 }
