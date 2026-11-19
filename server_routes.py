@@ -95,6 +95,19 @@ def register_static_routes(package_dir: Path) -> None:
                 three_quarter=payload.get("three_quarter"),
                 side=payload.get("side"),
                 depth_weight=float(payload.get("depth_weight", 1.0)),
+                enable_reliability_weighting=bool(payload.get("enable_reliability_weighting", True)),
+                mirror_transfer_weight=float(payload.get("mirror_transfer_weight", 0.85)),
+                enable_anatomical_weighting=bool(payload.get("enable_anatomical_weighting", True)),
+                structural_importance=float(payload.get("structural_importance", 1.75)),
+                secondary_importance=float(payload.get("secondary_importance", 1.0)),
+                fine_detail_importance=float(payload.get("fine_detail_importance", 0.65)),
+                unreliable_importance=float(payload.get("unreliable_importance", 0.10)),
+                huber_delta_ratio=float(payload.get("huber_delta_ratio", 0.08)),
+                enable_regularization=bool(payload.get("enable_regularization", True)),
+                base_geometry_anchoring=float(payload.get("base_geometry_anchoring", 0.25)),
+                surface_deformation_smoothness=float(payload.get("surface_deformation_smoothness", 0.45)),
+                max_local_displacement=float(payload.get("max_local_displacement", 0.18)),
+                symmetry_strength=float(payload.get("symmetry_strength", 0.0)),
             )
             return web.json_response(mesh_data)
         except Exception as exc:

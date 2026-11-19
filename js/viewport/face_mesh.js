@@ -14,6 +14,7 @@ import { OpenPoseFaceRig } from "./openpose_rig.js";
 import { EyeballRig } from "./eyeball_rig.js";
 
 const _worldCenter = new THREE.Vector3();
+const _dbgColor = new THREE.Color();
 const SKIN_SAMPLE_LANDMARKS = [50, 280, 117, 346, 151, 9, 195];
 
 let _headShellRigPromise = null;
@@ -148,7 +149,19 @@ export class ReconstructedFaceMesh {
         this.depthHullMesh.renderOrder = 0;
         this.depthHullMesh.frustumCulled = false;
         this.eyeballRig = new EyeballRig(this.material);
-        this.group.add(this.depthHullMesh, this.eyeballRig.group);
+        this.weightDebugGeo = new THREE.BufferGeometry();
+        this.weightDebugMat = new THREE.PointsMaterial({
+            size: 6.0,
+            sizeAttenuation: false,
+            vertexColors: true,
+            depthTest: true,
+            depthWrite: false,
+        });
+        this.weightDebugPoints = new THREE.Points(this.weightDebugGeo, this.weightDebugMat);
+        this.weightDebugPoints.visible = false;
+        this.weightDebugPoints.renderOrder = 5;
+        this.weightDebugPoints.frustumCulled = false;
+        this.group.add(this.depthHullMesh, this.eyeballRig.group, this.weightDebugPoints);
 
         this.frontTexture = null;
 
@@ -175,6 +188,12 @@ export class ReconstructedFaceMesh {
         this.lastMotionFrame = null;
         this.latestActivePositions = null;
         this.openPoseDirty = false;
+        this.landmarkWeights = null;
+        this.landmarkWeightsByView = null;
+        this.weightDebugStats = null;
+        this.weightDebugVisible = false;
+        this.weightDebugView = "combined";
+        this.weightDebugDirty = false;
 
         this.sculptState = null;
         this.regionWeights = null;
@@ -211,6 +230,22 @@ export class ReconstructedFaceMesh {
         this.baseIndices = meshData.indices;
         this.baseUvs = new Float32Array(meshData.uv_front);
         this.animScratch = new Float32Array(this.basePositions.length);
+        this.landmarkWeights = Array.isArray(meshData.landmark_weights)
+            ? new Float32Array(meshData.landmark_weights)
+            : null;
+        if (meshData.landmark_weights_by_view) {
+            const byView = meshData.landmark_weights_by_view;
+            this.landmarkWeightsByView = {
+                combined: Array.isArray(byView.combined) ? new Float32Array(byView.combined) : this.landmarkWeights,
+                front: Array.isArray(byView.front) ? new Float32Array(byView.front) : null,
+                three_quarter: Array.isArray(byView.three_quarter) ? new Float32Array(byView.three_quarter) : null,
+                side: Array.isArray(byView.side) ? new Float32Array(byView.side) : null,
+            };
+        } else {
+            this.landmarkWeightsByView = null;
+        }
+        this.weightDebugStats = meshData.weight_debug_stats || null;
+        this.weightDebugDirty = true;
 
         this.sculptRig = new SculptRig(this.basePositions, this.baseIndices);
         this.restPositions = this.sculptRig.evaluate(this.sculptState);
@@ -354,6 +389,66 @@ export class ReconstructedFaceMesh {
         } else {
             this.openPoseDirty = true;
         }
+
+        if (this.weightDebugVisible && this.viewMode !== "pose") {
+            this.syncWeightDebugOverlay(mergedOrFacePos);
+        } else {
+            this.weightDebugDirty = true;
+        }
+    }
+
+    setWeightDebugVisible(visible) {
+        this.weightDebugVisible = Boolean(visible);
+        this.syncPoseVisibility();
+    }
+
+    setWeightDebugView(viewKey) {
+        const valid = ["combined", "front", "three_quarter", "side"];
+        const next = valid.includes(viewKey) ? viewKey : "combined";
+        if (next === this.weightDebugView) return;
+        this.weightDebugView = next;
+        this.weightDebugDirty = true;
+        this.syncPoseVisibility();
+    }
+
+    syncWeightDebugOverlay(positions = this.latestActivePositions) {
+        if (!positions || !this.basePositions) return;
+        const nPts = Math.min(478, Math.floor(this.basePositions.length / 3), Math.floor(positions.length / 3));
+        if (nPts <= 0) return;
+
+        let posAttr = this.weightDebugGeo.getAttribute("position");
+        let colAttr = this.weightDebugGeo.getAttribute("color");
+        if (!posAttr || posAttr.count !== nPts) {
+            posAttr = new THREE.BufferAttribute(new Float32Array(nPts * 3), 3);
+            colAttr = new THREE.BufferAttribute(new Float32Array(nPts * 3), 3);
+            this.weightDebugGeo.setAttribute("position", posAttr);
+            this.weightDebugGeo.setAttribute("color", colAttr);
+        }
+
+        posAttr.array.set(positions.subarray(0, nPts * 3));
+        posAttr.needsUpdate = true;
+
+        const cols = colAttr.array;
+        const wArr = this.landmarkWeightsByView?.[this.weightDebugView] || this.landmarkWeights;
+        for (let i = 0; i < nPts; i++) {
+            const w = wArr && i < wArr.length ? wArr[i] : 1.0;
+            if (w > 0.70) {
+                _dbgColor.setHex(0x22c55e); // Green: high reliability
+            } else if (w >= 0.30) {
+                _dbgColor.setHex(0xfacc15); // Yellow: moderate reliability
+            } else if (w >= 0.05) {
+                _dbgColor.setHex(0xef4444); // Red: low reliability / boundary
+            } else {
+                _dbgColor.setHex(0x94a3b8); // Grey: occluded / unreliable
+            }
+            const o = i * 3;
+            cols[o] = _dbgColor.r;
+            cols[o + 1] = _dbgColor.g;
+            cols[o + 2] = _dbgColor.b;
+        }
+        colAttr.needsUpdate = true;
+        this.weightDebugGeo.computeBoundingSphere();
+        this.weightDebugDirty = false;
     }
 
     uploadFaceFrame(facePos) {
@@ -528,6 +623,12 @@ export class ReconstructedFaceMesh {
         this.guidesGroup.visible = !isPose && !this.shellRig && this.guidesVisible;
         this.depthHullMesh.visible = isPose && this.hasMesh && this.poseOcclude;
 
+        const showWeightDebug = !isPose && this.hasMesh && this.weightDebugVisible;
+        this.weightDebugPoints.visible = showWeightDebug;
+        if (showWeightDebug && this.weightDebugDirty && this.latestActivePositions) {
+            this.syncWeightDebugOverlay(this.latestActivePositions);
+        }
+
         if (this.openPoseRig) {
             const needPose = this.hasMesh && (isPose || this.poseOverlay);
             this.openPoseRig.group.visible = needPose;
@@ -673,9 +774,18 @@ export class ReconstructedFaceMesh {
         this.lastMotionFrame = null;
         this.latestActivePositions = null;
         this.openPoseDirty = false;
+        this.weightDebugGeo.deleteAttribute("position");
+        this.weightDebugGeo.deleteAttribute("color");
+        this.weightDebugGeo.boundingSphere = null;
+        this.landmarkWeights = null;
+        this.landmarkWeightsByView = null;
+        this.weightDebugStats = null;
+        this.weightDebugDirty = false;
         if (resetParams) {
             this.sculptState = null;
             this.regionWeights = null;
+            this.weightDebugVisible = false;
+            this.weightDebugView = "combined";
         }
         this.group.rotation.set(0, 0, 0);
         this.group.quaternion.identity();
@@ -690,6 +800,8 @@ export class ReconstructedFaceMesh {
         this.geometry.dispose();
         this.material.dispose();
         this.depthHullMaterial.dispose();
+        this.weightDebugGeo.dispose();
+        this.weightDebugMat.dispose();
         this.eyeballRig.dispose();
         this.openPoseRig?.dispose();
         this.neckGeo.dispose();

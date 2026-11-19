@@ -4,6 +4,7 @@ import { OrbitControls } from "../lib/OrbitControls.js";
 import { createPlaceholderHead } from "./placeholder_head.js";
 import { ReconstructedFaceMesh } from "./face_mesh.js";
 import { renderAndUploadPasses } from "./offscreen_renderer.js";
+import { stopViewportEvents } from "./ui_icons.js";
 import {
     detectFaceForVideo,
     detectOptionalFaceFromDataUrl,
@@ -53,6 +54,19 @@ export class FaceViewport {
         this.resizeObserver = null;
         this.viewMode = "textured";
         this.guidesVisible = true;
+        this.enableReliabilityWeighting = true;
+        this.enableAnatomicalWeighting = true;
+        this.enableRegularization = true;
+        this.weightDebugEnabled = false;
+        this.weightDebugView = "combined";
+        this.weightDebugBtn = null;
+        this.weightDebugViewBtn = null;
+        this.relWeightBtn = null;
+        this.anatWeightBtn = null;
+        this.regBtn = null;
+        this.regRebuildTimer = null;
+        this.lastRegState = { baseAnchor: 0.25, dispSmooth: 0.45, maxDisp: 0.18, symmetry: 0.0 };
+        this.lastMocapWeightState = { eyes: 1.15, brows: 1.0, mouth: 1.0, mouthWidth: 0.55, jaw: 0.85, cheeks: 0.45 };
         this.onGuidesChanged = null;
         this.depthWeight = 1.0;
         this.turntableFrames = 24;
@@ -263,6 +277,219 @@ export class FaceViewport {
             this.setGuidesVisible(next);
             this.onGuidesChanged?.(next);
         });
+
+        this.initWeightDebugControls();
+    }
+
+    initWeightDebugControls() {
+        if (!this.ui?.hudLayer) return;
+        const bar = document.createElement("div");
+        Object.assign(bar.style, {
+            position: "absolute",
+            top: "10px",
+            right: "10px",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "flex-end",
+            gap: "4px",
+            zIndex: "10",
+            pointerEvents: "auto",
+        });
+        stopViewportEvents(bar);
+
+        const makeToggle = (label, title) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.textContent = label;
+            btn.title = title;
+            Object.assign(btn.style, {
+                fontSize: "10px",
+                fontWeight: "600",
+                color: "#cbd5e1",
+                backgroundColor: "rgba(15, 18, 25, 0.82)",
+                border: "1px solid rgba(255, 255, 255, 0.16)",
+                borderRadius: "5px",
+                padding: "3px 8px",
+                cursor: "pointer",
+                backdropFilter: "blur(4px)",
+            });
+            stopViewportEvents(btn);
+            return btn;
+        };
+
+        this.weightDebugBtn = makeToggle(
+            "Weight Debug",
+            "Show per-landmark Phase 1/2 reliability points (Green >0.7, Yellow 0.3-0.7, Red 0.05-0.3, Grey <0.05)"
+        );
+        this.weightDebugViewBtn = makeToggle(
+            "All",
+            "Cycle Weight Debug view (All | 3Q | Side | Front)"
+        );
+        this.relWeightBtn = makeToggle(
+            "Rel. Weight: ON",
+            "Toggle Phase 1 landmark reliability & visibility weighting (side-by-side comparison)"
+        );
+        this.anatWeightBtn = makeToggle(
+            "Anat+Huber: ON",
+            "Toggle Phase 2 anatomical group importance & Huber outlier damping"
+        );
+        this.regBtn = makeToggle(
+            "Reg: ON",
+            "Toggle Phase 3 displacement regularization (Base Anchor, Disp Smooth, Max Disp, Symmetry)"
+        );
+
+        const debugRow = document.createElement("div");
+        Object.assign(debugRow.style, {
+            display: "flex",
+            alignItems: "center",
+            gap: "4px",
+        });
+        debugRow.append(this.weightDebugBtn, this.weightDebugViewBtn);
+
+        const phase23Row = document.createElement("div");
+        Object.assign(phase23Row.style, {
+            display: "flex",
+            alignItems: "center",
+            gap: "4px",
+        });
+        phase23Row.append(this.anatWeightBtn, this.regBtn);
+
+        this.weightDebugBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.setWeightDebugEnabled(!this.weightDebugEnabled);
+        });
+        this.weightDebugViewBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.cycleWeightDebugView();
+        });
+        this.relWeightBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.setEnableReliabilityWeighting(!this.enableReliabilityWeighting);
+        });
+        this.anatWeightBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.setEnableAnatomicalWeighting(!this.enableAnatomicalWeighting);
+        });
+        this.regBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.setEnableRegularization(!this.enableRegularization);
+        });
+
+        bar.append(debugRow, this.relWeightBtn, phase23Row);
+        this.ui.hudLayer.appendChild(bar);
+        this.syncWeightDebugButtons();
+    }
+
+    getAvailableWeightDebugViews() {
+        const byView = this.reconstructedFace?.landmarkWeightsByView;
+        const views = ["combined"];
+        if (byView?.three_quarter || this.extractedViews.three_quarter) views.push("three_quarter");
+        if (byView?.side || this.extractedViews.side) views.push("side");
+        views.push("front");
+        return views;
+    }
+
+    cycleWeightDebugView() {
+        const avail = this.getAvailableWeightDebugViews();
+        const curIdx = avail.indexOf(this.weightDebugView);
+        const nextView = avail[(curIdx + 1) % avail.length];
+        this.setWeightDebugView(nextView);
+    }
+
+    setWeightDebugView(viewKey) {
+        const avail = this.getAvailableWeightDebugViews();
+        this.weightDebugView = avail.includes(viewKey) ? viewKey : "combined";
+        this.reconstructedFace?.setWeightDebugView(this.weightDebugView);
+        this.syncWeightDebugButtons();
+    }
+
+    syncWeightDebugButtons() {
+        const viewLabels = {
+            combined: "All",
+            three_quarter: "3Q",
+            side: "Side",
+            front: "Front",
+        };
+        if (this.weightDebugBtn) {
+            const active = this.weightDebugEnabled;
+            this.weightDebugBtn.style.borderColor = active ? "#38bdf8" : "rgba(255, 255, 255, 0.16)";
+            this.weightDebugBtn.style.color = active ? "#38bdf8" : "#cbd5e1";
+        }
+        if (this.weightDebugViewBtn) {
+            this.weightDebugViewBtn.style.display = this.weightDebugEnabled ? "inline-block" : "none";
+            this.weightDebugViewBtn.textContent = viewLabels[this.weightDebugView] || "All";
+            this.weightDebugViewBtn.style.borderColor = this.weightDebugView === "combined" ? "rgba(255, 255, 255, 0.22)" : "#38bdf8";
+            this.weightDebugViewBtn.style.color = this.weightDebugView === "combined" ? "#e2e8f0" : "#38bdf8";
+        }
+        if (this.relWeightBtn) {
+            const on = this.enableReliabilityWeighting;
+            this.relWeightBtn.textContent = on ? "Rel. Weight: ON" : "Rel. Weight: OFF";
+            this.relWeightBtn.style.borderColor = on ? "#22c55e" : "#f59e0b";
+            this.relWeightBtn.style.color = on ? "#4ade80" : "#fbbf24";
+        }
+        if (this.anatWeightBtn) {
+            const relOn = this.enableReliabilityWeighting;
+            const on = relOn && this.enableAnatomicalWeighting;
+            this.anatWeightBtn.textContent = on ? "Anat+Huber: ON" : "Anat+Huber: OFF";
+            this.anatWeightBtn.style.borderColor = on ? "#22c55e" : "rgba(255, 255, 255, 0.16)";
+            this.anatWeightBtn.style.color = on ? "#4ade80" : (relOn ? "#fbbf24" : "#64748b");
+            this.anatWeightBtn.style.opacity = relOn ? "1.0" : "0.6";
+        }
+        if (this.regBtn) {
+            const on = this.enableRegularization;
+            this.regBtn.textContent = on ? "Reg: ON" : "Reg: OFF";
+            this.regBtn.style.borderColor = on ? "#22c55e" : "#f59e0b";
+            this.regBtn.style.color = on ? "#4ade80" : "#fbbf24";
+        }
+    }
+
+    setWeightDebugEnabled(enabled) {
+        this.weightDebugEnabled = Boolean(enabled);
+        this.reconstructedFace?.setWeightDebugView(this.weightDebugView);
+        this.reconstructedFace?.setWeightDebugVisible(this.weightDebugEnabled);
+        this.syncWeightDebugButtons();
+    }
+
+    setEnableReliabilityWeighting(enabled) {
+        const next = Boolean(enabled);
+        if (next === this.enableReliabilityWeighting) return;
+        this.enableReliabilityWeighting = next;
+        this.syncWeightDebugButtons();
+        if (this.extractedViews.front) {
+            this.runReconstruction();
+        }
+    }
+
+    setEnableAnatomicalWeighting(enabled) {
+        const next = Boolean(enabled);
+        if (next === this.enableAnatomicalWeighting) return;
+        this.enableAnatomicalWeighting = next;
+        this.syncWeightDebugButtons();
+        if (this.extractedViews.front) {
+            this.runReconstruction();
+        }
+    }
+
+    setEnableRegularization(enabled) {
+        const next = Boolean(enabled);
+        if (next === this.enableRegularization) return;
+        this.enableRegularization = next;
+        this.syncWeightDebugButtons();
+        if (this.extractedViews.front) {
+            this.runReconstruction();
+        }
+    }
+
+    scheduleReconstruction() {
+        if (this.regRebuildTimer !== null) {
+            clearTimeout(this.regRebuildTimer);
+        }
+        this.regRebuildTimer = setTimeout(() => {
+            this.regRebuildTimer = null;
+            if (!this.disposed && this.extractedViews.front) {
+                this.runReconstruction();
+            }
+        }, 80);
     }
 
     setViewMode(mode) {
@@ -322,8 +549,41 @@ export class FaceViewport {
         this.reconstructedFace?.updateLights(lightState);
     }
 
+    syncWeightTrackingFromPanel(weightState = this.ui.weightPanel?.getState()) {
+        if (!weightState) return;
+        for (const k of ["eyes", "brows", "mouth", "mouthWidth", "jaw", "cheeks"]) {
+            if (weightState[k] !== undefined) this.lastMocapWeightState[k] = Number(weightState[k]);
+        }
+        for (const k of ["baseAnchor", "dispSmooth", "maxDisp", "symmetry"]) {
+            if (weightState[k] !== undefined) this.lastRegState[k] = Number(weightState[k]);
+        }
+    }
+
     updateWeights(weightState) {
-        this.reconstructedFace?.setRegionWeights(weightState);
+        if (!weightState) return;
+        let mocapChanged = false;
+        for (const k of ["eyes", "brows", "mouth", "mouthWidth", "jaw", "cheeks"]) {
+            const v = Number(weightState[k]);
+            if (Number.isFinite(v) && v !== this.lastMocapWeightState[k]) {
+                this.lastMocapWeightState[k] = v;
+                mocapChanged = true;
+            }
+        }
+        if (mocapChanged) {
+            this.reconstructedFace?.setRegionWeights(weightState);
+        }
+
+        let regChanged = false;
+        for (const k of ["baseAnchor", "dispSmooth", "maxDisp", "symmetry"]) {
+            const v = Number(weightState[k]);
+            if (Number.isFinite(v) && v !== this.lastRegState[k]) {
+                this.lastRegState[k] = v;
+                regChanged = true;
+            }
+        }
+        if (regChanged && this.extractedViews.front) {
+            this.scheduleReconstruction();
+        }
     }
 
     updateSculpt(sculptState) {
@@ -913,6 +1173,8 @@ export class FaceViewport {
         try {
             const hadMeshBefore = this.reconstructedFace.hasMesh;
             const triangles = await getTesselationTriangles();
+            const wState = this.ui.weightPanel?.getState() || {};
+            this.syncWeightTrackingFromPanel(wState);
             const response = await api.fetchApi("/yedp_face3d/reconstruct", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -922,6 +1184,13 @@ export class FaceViewport {
                     side: this.extractedViews.side,
                     triangles,
                     depth_weight: this.depthWeight,
+                    enable_reliability_weighting: this.enableReliabilityWeighting,
+                    enable_anatomical_weighting: this.enableAnatomicalWeighting,
+                    enable_regularization: this.enableRegularization,
+                    base_geometry_anchoring: Number(wState.baseAnchor ?? 0.25),
+                    surface_deformation_smoothness: Number(wState.dispSmooth ?? 0.45),
+                    max_local_displacement: Number(wState.maxDisp ?? 0.18),
+                    symmetry_strength: Number(wState.symmetry ?? 0.0),
                 }),
             });
 
@@ -938,8 +1207,15 @@ export class FaceViewport {
             await this.reconstructedFace.updateFromReconstruction(meshData, this.refUrls.front);
             if (this.disposed || token !== this.reconstructToken) return;
 
+            const availDebugViews = this.getAvailableWeightDebugViews();
+            if (!availDebugViews.includes(this.weightDebugView)) {
+                this.weightDebugView = "combined";
+            }
             this.reconstructedFace.setGuidesVisible(this.guidesVisible);
             this.reconstructedFace.setViewMode(this.viewMode);
+            this.reconstructedFace.setWeightDebugView(this.weightDebugView);
+            this.reconstructedFace.setWeightDebugVisible(this.weightDebugEnabled);
+            this.syncWeightDebugButtons();
             this.reconstructedFace.applyRenderState(this.renderState);
 
             this.placeholderHead.group.visible = false;
@@ -1031,6 +1307,7 @@ export class FaceViewport {
             this.renderState = this.ui.renderPanel.getState();
             this.setStatus(`Rendering ${render_width}x${render_height}...`);
             this.isExporting = true;
+            this.reconstructedFace?.setWeightDebugVisible(false);
             try {
                 await renderAndUploadPasses({
                     jobId: job_id,
@@ -1054,6 +1331,7 @@ export class FaceViewport {
                 });
             } finally {
                 this.isExporting = false;
+                this.reconstructedFace?.setWeightDebugVisible(this.weightDebugEnabled);
             }
 
             this.updateRenderUI();
@@ -1098,6 +1376,17 @@ export class FaceViewport {
         this.ui.lightPanel.reset(false);
 
         this.reconstructedFace.clear(true);
+        if (this.regRebuildTimer !== null) {
+            clearTimeout(this.regRebuildTimer);
+            this.regRebuildTimer = null;
+        }
+        this.weightDebugEnabled = false;
+        this.weightDebugView = "combined";
+        this.enableReliabilityWeighting = true;
+        this.enableAnatomicalWeighting = true;
+        this.enableRegularization = true;
+        this.syncWeightTrackingFromPanel(this.ui.weightPanel.getState());
+        this.syncWeightDebugButtons();
         this.reconstructedFace.updateLights(this.ui.lightPanel.getState());
         this.reconstructedFace.setRegionWeights(this.ui.weightPanel.getState());
         this.reconstructedFace.setSculptState(this.ui.sculptPanel.getState());
@@ -1152,6 +1441,7 @@ export class FaceViewport {
         }
         if (saved.weights && this.ui.weightPanel?.setState) {
             this.ui.weightPanel.setState(saved.weights, false);
+            this.syncWeightTrackingFromPanel(this.ui.weightPanel.getState());
         }
         if (saved.lights && this.ui.lightPanel?.setState) {
             this.ui.lightPanel.setState(saved.lights, false);
@@ -1439,6 +1729,10 @@ export class FaceViewport {
         this.resetToken += 1;
         this.loadToken++;
         this.reconstructToken++;
+        if (this.regRebuildTimer !== null) {
+            clearTimeout(this.regRebuildTimer);
+            this.regRebuildTimer = null;
+        }
         this.stopWebcam();
 
         if (this.rafId !== null) {

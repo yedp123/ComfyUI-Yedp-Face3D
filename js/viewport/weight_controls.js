@@ -7,6 +7,10 @@ export const DEFAULT_WEIGHT_STATE = {
     mouthWidth: 0.55,
     jaw: 0.85,
     cheeks: 0.45,
+    baseAnchor: 0.25,
+    dispSmooth: 0.45,
+    maxDisp: 0.18,
+    symmetry: 0.0,
 };
 
 /**
@@ -75,6 +79,22 @@ export function createWeightPanel(onChange) {
     addSlider("Mouth Width", "mouthWidth", 0, 1.5, 0.05);
     addSlider("Jaw", "jaw", 0, 2, 0.05);
     addSlider("Cheeks", "cheeks", 0, 1.5, 0.05);
+
+    const regHeader = document.createElement("div");
+    regHeader.textContent = "Geometry Regularization";
+    Object.assign(regHeader.style, {
+        fontWeight: "600",
+        color: "#94a3b8",
+        borderBottom: "1px solid rgba(255,255,255,0.08)",
+        paddingBottom: "2px",
+        marginTop: "4px",
+    });
+    panel.appendChild(regHeader);
+
+    addSlider("Base Anchor", "baseAnchor", 0, 1, 0.05);
+    addSlider("Disp. Smooth", "dispSmooth", 0, 1, 0.05);
+    addSlider("Max Disp.", "maxDisp", 0.05, 0.50, 0.01);
+    addSlider("Symmetry", "symmetry", 0, 1, 0.05);
 
     const note = document.createElement("div");
     note.textContent = "Intermediate vertices blend smoothly across mesh edges.";
