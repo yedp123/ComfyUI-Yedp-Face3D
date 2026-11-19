@@ -426,17 +426,23 @@ def _compute_view_reliability(
     det_w = _compute_detector_weights(landmarks, n_verts)
     bnd_w = _compute_boundary_weights(landmarks, n_verts)
 
-    vis_w = np.zeros(n_verts, dtype=np.float32)
+    vis_normal_w = np.zeros(n_verts, dtype=np.float32)
+    midline_w = np.ones(n_verts, dtype=np.float32)
     facing_w = np.zeros(n_verts, dtype=np.float32)
     if n_face > 0:
         facing = normals_face[:n_face] @ view_dir_v
         facing_w[:n_face] = np.clip(facing, 0.0, 1.0)
-        vis_w[:n_face] = _smoothstep(0.05, 0.35, facing)
+        vis_normal_w[:n_face] = _smoothstep(0.05, 0.35, facing)
 
         # Midline nose-bridge self-occlusion culling for side profiles:
-        # far eye & far cheek on the occluded side of the nose bridge drop smoothly to 0.0.
+        # Lock yaw_sign strictly to vis_view_dir.x (-sin(yaw_eff)) so normal visibility
+        # and midline occlusion always protect the same hemisphere:
+        # yaw_eff > 0 => vis_view_dir.x < 0 => yaw_sign = +1.0 (-X visible, +X occluded)
+        # yaw_eff < 0 => vis_view_dir.x > 0 => yaw_sign = -1.0 (+X visible, -X occluded)
         if is_side:
-            if abs(yaw_eff_deg) > 1e-4:
+            if abs(float(view_dir_v[0])) > 1e-4:
+                yaw_sign = 1.0 if float(view_dir_v[0]) < 0.0 else -1.0
+            elif abs(yaw_eff_deg) > 1e-4:
                 yaw_sign = 1.0 if yaw_eff_deg > 0.0 else -1.0
             else:
                 nose_x = float(landmarks[NOSE_TIP_IDX]["x"]) if len(landmarks) > NOSE_TIP_IDX else 0.5
@@ -444,14 +450,18 @@ def _compute_view_reliability(
                 yaw_sign = 1.0 if nose_x >= bridge_x else -1.0
             max_abs_x = max(float(np.max(np.abs(front_pts[:n_face, 0]))), 1e-5)
             hidden_x_norm = (front_pts[:n_face, 0] * yaw_sign) / max_abs_x
-            midline_vis = 1.0 - _smoothstep(0.02, 0.14, hidden_x_norm)
-            vis_w[:n_face] *= midline_vis
-            facing_w[:n_face] *= midline_vis
+            midline_w[:n_face] = 1.0 - _smoothstep(0.02, 0.14, hidden_x_norm)
+            facing_w[:n_face] *= midline_w[:n_face]
 
+    vis_w = (vis_normal_w * midline_w).astype(np.float32)
     if n_verts >= 473 and n_face > 159:
+        vis_normal_w[468:473] = 0.5 * (vis_normal_w[159] + vis_normal_w[145])
+        midline_w[468:473] = 0.5 * (midline_w[159] + midline_w[145])
         vis_w[468:473] = 0.5 * (vis_w[159] + vis_w[145])
         facing_w[468:473] = 0.5 * (facing_w[159] + facing_w[145])
     if n_verts >= 478 and n_face > 386:
+        vis_normal_w[473:478] = 0.5 * (vis_normal_w[386] + vis_normal_w[374])
+        midline_w[473:478] = 0.5 * (midline_w[386] + midline_w[374])
         vis_w[473:478] = 0.5 * (vis_w[386] + vis_w[374])
         facing_w[473:478] = 0.5 * (facing_w[386] + facing_w[374])
 
@@ -459,13 +469,31 @@ def _compute_view_reliability(
         cons_w = np.ones(n_verts, dtype=np.float32)
     else:
         inv_h = 1.0 / max(face_height, 1e-4)
-        err_y = np.abs(pts_v[:, 1] - front_pts[:, 1]) * inv_h
+        y_v = pts_v[:, 1]
+        if is_side and n_face > NOSE_BRIDGE_IDX:
+            # Guard vertical consistency against 3D eye-mouth scale drift caused by hallucinated occluded-eye Z.
+            f_nose = abs(float(front_pts[NOSE_BRIDGE_IDX, 1] - front_pts[2, 1]))
+            v_nose = abs(float(pts_v[NOSE_BRIDGE_IDX, 1] - pts_v[2, 1]))
+            if f_nose > 0.15 * face_height and v_nose > 0.05 * face_height:
+                r_y = f_nose / v_nose
+                if abs(r_y - 1.0) > 0.08:
+                    y_v = y_v * float(np.clip(r_y, 0.75, 1.35))
+
+        err_y = np.abs(y_v - front_pts[:, 1]) * inv_h
         err_x = np.abs(pts_v[:, 0] - front_pts[:, 0]) * inv_h
-        # Keep vertical alignment tight (catches open-mouth/pose mismatch) while tolerating
-        # matrix-compressed horizontal foreshortening proportional to yaw mismatch.
+        # Horizontal X foreshortens under yaw while MediaPipe's 4x4 matrix under-rotates steep profiles;
+        # attenuate dx error by yaw so valid visible cheeks are not crushed while keeping dy full-strength.
+        abs_yaw_deg = abs(float(yaw_eff_deg))
+        if is_side:
+            x_atten = 0.15
+        elif abs_yaw_deg >= 25.0:
+            x_atten = max(float(np.cos(np.radians(abs_yaw_deg))) ** 2, 0.15)
+        else:
+            x_atten = 1.0
+
         x_slack = 0.14 * float(np.sin(min(abs(yaw_mismatch_rad), 1.48)))
-        cons_y = 1.0 - _smoothstep(0.05, 0.14, err_y)
-        cons_x = 1.0 - _smoothstep(0.06 + x_slack, 0.16 + x_slack * 1.5, err_x)
+        cons_y = 1.0 - _smoothstep(0.07 if is_side else 0.05, 0.18 if is_side else 0.14, err_y)
+        cons_x = 1.0 - _smoothstep(0.06 + x_slack, 0.16 + x_slack * 1.5, err_x * x_atten)
         cons_w = (cons_y * cons_x).astype(np.float32)
 
     w_v = np.clip(det_w * vis_w * bnd_w * cons_w, 0.0, 1.0).astype(np.float32)
@@ -473,6 +501,8 @@ def _compute_view_reliability(
         "w": w_v,
         "det_w": det_w,
         "vis_w": vis_w,
+        "vis_normal_w": vis_normal_w,
+        "midline_w": midline_w,
         "facing_w": facing_w,
         "bnd_w": bnd_w,
         "cons_w": cons_w,
@@ -546,9 +576,8 @@ def _smooth_nostril_transition(
     return out
 
 
-def _apply_side_2d_profile(
+def _extract_side_2d_profile_delta(
     merged: np.ndarray,
-    neighbors: list[list[int]],
     side_landmarks: list[dict],
     side_width: int,
     side_height: int,
@@ -556,13 +585,10 @@ def _apply_side_2d_profile(
     side_rel: dict | None = None,
     anat_mult: np.ndarray | None = None,
     secondary_importance: float = 1.0,
-    huber_delta: float | None = None,
-    stats_out: dict | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray] | None:
     """
-    Extract exact 2D (Z, Y) sagittal silhouette from a side-profile photo by exact
-    landmark ID (never shifted by Y-interpolation) and diffuse smoothly across the
-    central nose/lips/chin ridge via Graph Laplacian propagation.
+    Extract scaled and pitch-aligned 2D (Z, Y) sagittal delta_z and reliability alpha
+    from one side-profile photo by exact landmark ID.
     """
     aspect = float(side_height) / max(float(side_width), 1.0)
     nose_x = float(side_landmarks[NOSE_TIP_IDX]["x"])
@@ -581,7 +607,7 @@ def _apply_side_2d_profile(
     side_chin_z = facing_sign * (float(side_landmarks[CHIN_IDX]["x"]) - bridge_x)
     side_span = float(np.hypot(side_chin_z, side_chin_y))
     if side_span < 1e-4:
-        return merged
+        return None
 
     scale = front_span_y / side_span
 
@@ -625,13 +651,86 @@ def _apply_side_2d_profile(
         else:
             sag_alpha[idx] = 1.0
 
-    if huber_delta is not None and huber_delta > 0.0:
-        damped_dz, damped_mask = _huber_damp(delta_z, float(huber_delta))
-        if stats_out is not None:
-            stats_out["huber_damped"] = int(stats_out.get("huber_damped", 0)) + int(
-                np.sum(damped_mask & (sag_alpha > 0.0))
-            )
-        delta_z = damped_dz
+    return delta_z, sag_alpha
+
+
+def _fuse_side_2d_profiles(
+    merged: np.ndarray,
+    neighbors: list[list[int]],
+    side_entries: list[dict],
+    enable_reliability_weighting: bool = True,
+    anat_mult: np.ndarray | None = None,
+    secondary_importance: float = 1.0,
+    huber_delta: float | None = None,
+    stats_out: dict | None = None,
+) -> np.ndarray:
+    """
+    Fuse 1 or more side-profile views along the sagittal midline (with Huber disagreement damping
+    when multiple side views are present), then run a single screened Laplacian diffusion pass.
+    """
+    extracted: list[tuple[np.ndarray, np.ndarray]] = []
+    for entry in side_entries:
+        view_dict = entry["view"]
+        res = _extract_side_2d_profile_delta(
+            merged=merged,
+            side_landmarks=view_dict["landmarks"],
+            side_width=int(view_dict.get("width", 512)),
+            side_height=int(view_dict.get("height", 512)),
+            enable_reliability_weighting=enable_reliability_weighting,
+            side_rel=entry.get("rel"),
+            anat_mult=anat_mult,
+            secondary_importance=secondary_importance,
+        )
+        if res is not None:
+            extracted.append(res)
+
+    if not extracted:
+        return merged
+
+    n_verts = len(merged)
+    n_face = min(n_verts, MAX_FACE_MESH_VERTS)
+
+    if len(extracted) == 1:
+        delta_z, sag_alpha = extracted[0]
+        if huber_delta is not None and huber_delta > 0.0:
+            damped_dz, damped_mask = _huber_damp(delta_z, float(huber_delta))
+            if stats_out is not None:
+                stats_out["huber_damped"] = int(stats_out.get("huber_damped", 0)) + int(
+                    np.sum(damped_mask & (sag_alpha > 0.0))
+                )
+            delta_z = damped_dz
+    else:
+        dz_stack = np.stack([d for d, _ in extracted], axis=0)
+        a_stack = np.stack([a for _, a in extracted], axis=0)
+        w_sum = np.sum(a_stack, axis=0)
+        active_cnt = np.sum(a_stack > 0.0, axis=0)
+        mask_valid = w_sum > 1e-6
+
+        dz_mean = np.zeros(n_verts, dtype=np.float32)
+        dz_mean[mask_valid] = np.sum(a_stack[:, mask_valid] * dz_stack[:, mask_valid], axis=0) / w_sum[mask_valid]
+
+        dz_adj = dz_stack.copy()
+        disagree_damped_mask = np.zeros(n_verts, dtype=bool)
+        if enable_reliability_weighting and huber_delta is not None and huber_delta > 0.0:
+            disagree_delta = 0.5 * float(huber_delta)
+            for k in range(len(extracted)):
+                active_k = (active_cnt >= 2) & (a_stack[k] > 0.0)
+                res_k = np.where(active_k, dz_stack[k] - dz_mean, 0.0).astype(np.float32)
+                damped_res_k, mask_k = _huber_damp(res_k, disagree_delta)
+                dz_adj[k] = np.where(active_k, dz_mean + damped_res_k, dz_stack[k])
+                disagree_damped_mask |= mask_k & active_k
+
+        delta_z = np.zeros(n_verts, dtype=np.float32)
+        delta_z[mask_valid] = np.sum(a_stack[:, mask_valid] * dz_adj[:, mask_valid], axis=0) / w_sum[mask_valid]
+        sag_alpha = np.clip(np.max(a_stack, axis=0), 0.0, 1.0).astype(np.float32)
+
+        if huber_delta is not None and huber_delta > 0.0:
+            damped_dz, mag_mask = _huber_damp(delta_z, float(huber_delta))
+            delta_z = damped_dz
+            if stats_out is not None:
+                stats_out["huber_damped"] = int(stats_out.get("huber_damped", 0)) + int(
+                    np.sum((disagree_damped_mask | mag_mask) & (sag_alpha > 0.0))
+                )
 
     diffused = delta_z.copy()
     for _ in range(5):
@@ -653,6 +752,35 @@ def _apply_side_2d_profile(
     ridge_weight = 1.0 - _smoothstep(0.10, 0.42, abs_x_norm)
     out[:n_face, 2] += diffused[:n_face] * ridge_weight * 0.85
     return out
+
+
+def _apply_side_2d_profile(
+    merged: np.ndarray,
+    neighbors: list[list[int]],
+    side_landmarks: list[dict],
+    side_width: int,
+    side_height: int,
+    enable_reliability_weighting: bool = True,
+    side_rel: dict | None = None,
+    anat_mult: np.ndarray | None = None,
+    secondary_importance: float = 1.0,
+    huber_delta: float | None = None,
+    stats_out: dict | None = None,
+) -> np.ndarray:
+    """Single-side wrapper forwarding to _fuse_side_2d_profiles for compatibility."""
+    return _fuse_side_2d_profiles(
+        merged=merged,
+        neighbors=neighbors,
+        side_entries=[{
+            "view": {"landmarks": side_landmarks, "width": side_width, "height": side_height},
+            "rel": side_rel,
+        }],
+        enable_reliability_weighting=enable_reliability_weighting,
+        anat_mult=anat_mult,
+        secondary_importance=secondary_importance,
+        huber_delta=huber_delta,
+        stats_out=stats_out,
+    )
 
 
 def _build_inverse_edge_weights(
@@ -780,9 +908,11 @@ def reconstruct_face_mesh(
     surface_deformation_smoothness: float = 0.45,
     max_local_displacement: float = 0.18,
     symmetry_strength: float = 0.0,
+    three_quarter_2: dict | None = None,
+    side_2: dict | None = None,
 ) -> dict:
     """
-    Reconstruct a canonical 468/478-vertex textured face mesh from 1-3 MediaPipe views.
+    Reconstruct a canonical 468/478-vertex textured face mesh from 1-5 MediaPipe views.
 
     Each view dict expects: {"landmarks": [...], "matrix": [...]|None, "width": int, "height": int}.
     """
@@ -814,68 +944,55 @@ def reconstruct_face_mesh(
         is_front=True,
     )
 
-    # Front view drives X/Y and texture; 3/4 and Side views refine 3D Z depth only.
+    # Front view drives X/Y and texture; extra 3/4 and side views refine 3D Z depth only.
     merged = front_pts.copy()
     half_width = max(float(np.max(np.abs(front_pts[:, 0]))), 1e-4)
     abs_x_norm = np.abs(front_pts[:, 0]) / half_width
 
-    has_3q = three_quarter is not None and bool(three_quarter.get("landmarks"))
-    pts_3q = None
-    pose_3q = None
-    vis_pose_3q = None
-    rel_3q = None
-    if has_3q:
-        pts_3q, _, pose_3q = canonicalize_view(
-            three_quarter["landmarks"],
-            three_quarter.get("matrix"),
-            int(three_quarter.get("width", 512)),
-            int(three_quarter.get("height", 512)),
+    extra_view_specs = (
+        ("three_quarter", three_quarter, False),
+        ("three_quarter_2", three_quarter_2, False),
+        ("side", side, True),
+        ("side_2", side_2, True),
+    )
+    extra_records: dict[str, dict] = {}
+    for view_key, view_dict, is_side_slot in extra_view_specs:
+        if view_dict is None or not view_dict.get("landmarks"):
+            continue
+        pts_v, _, pose_v = canonicalize_view(
+            view_dict["landmarks"],
+            view_dict.get("matrix"),
+            int(view_dict.get("width", 512)),
+            int(view_dict.get("height", 512)),
         )
-        vis_pose_3q = _estimate_effective_visibility_pose(three_quarter["landmarks"], pose_3q)
-        rel_3q = _compute_view_reliability(
-            three_quarter["landmarks"],
-            pts_3q,
-            vis_pose_3q["vis_view_dir"],
+        vis_pose_v = _estimate_effective_visibility_pose(view_dict["landmarks"], pose_v)
+        rel_v = _compute_view_reliability(
+            view_dict["landmarks"],
+            pts_v,
+            vis_pose_v["vis_view_dir"],
             front_pts,
             normals_face,
             face_height,
             is_front=False,
-            yaw_mismatch_rad=np.radians(vis_pose_3q["yaw_eff_deg"] - vis_pose_3q["yaw_mat_deg"]),
-            is_side=False,
-            yaw_eff_deg=vis_pose_3q["yaw_eff_deg"],
+            yaw_mismatch_rad=np.radians(vis_pose_v["yaw_eff_deg"] - vis_pose_v["yaw_mat_deg"]),
+            is_side=is_side_slot,
+            yaw_eff_deg=vis_pose_v["yaw_eff_deg"],
         )
+        extra_records[view_key] = {
+            "key": view_key,
+            "view": view_dict,
+            "is_side": is_side_slot,
+            "pts": pts_v,
+            "pose": pose_v,
+            "vis_pose": vis_pose_v,
+            "rel": rel_v,
+            "occluded": int(np.sum(rel_v["vis_w"][:n_face] < 0.15)),
+        }
 
-    has_side = side is not None and bool(side.get("landmarks"))
-    pts_side = None
-    pose_side = None
-    vis_pose_side = None
-    rel_side = None
-    if has_side:
-        pts_side, _, pose_side = canonicalize_view(
-            side["landmarks"],
-            side.get("matrix"),
-            int(side.get("width", 512)),
-            int(side.get("height", 512)),
-        )
-        vis_pose_side = _estimate_effective_visibility_pose(side["landmarks"], pose_side)
-        rel_side = _compute_view_reliability(
-            side["landmarks"],
-            pts_side,
-            vis_pose_side["vis_view_dir"],
-            front_pts,
-            normals_face,
-            face_height,
-            is_front=False,
-            yaw_mismatch_rad=np.radians(vis_pose_side["yaw_eff_deg"] - vis_pose_side["yaw_mat_deg"]),
-            is_side=True,
-            yaw_eff_deg=vis_pose_side["yaw_eff_deg"],
-        )
-
-    occluded_3q = int(np.sum(rel_3q["vis_w"][:n_face] < 0.15)) if rel_3q is not None else 0
-    occluded_side = int(np.sum(rel_side["vis_w"][:n_face] < 0.15)) if rel_side is not None else 0
     mirrored_transfers = 0
     huber_stats = {"huber_damped": 0}
-    mirror_map = _build_mirror_map(front_pts) if (has_3q or has_side) else None
+    has_extra = bool(extra_records)
+    mirror_map = _build_mirror_map(front_pts) if has_extra else None
 
     anat_mult, anat_group_counts = _build_anatomical_weights(
         n_verts,
@@ -895,49 +1012,58 @@ def reconstruct_face_mesh(
         z_num = w_front_eff * front_pts[:, 2]
         w_den = w_front_eff.copy()
 
-        for pts_v, rel_v in ((pts_3q, rel_3q), (pts_side, rel_side)):
-            if pts_v is None or rel_v is None:
-                continue
-            vis_v = rel_v["vis_w"]
-            w_v = rel_v["w"]
-            fusion_v = w_v * (0.35 + 0.65 * rel_v["facing_w"])
-            z_v = pts_v[:, 2].copy()
-            w_eff = fusion_v.copy()
+        extra_vis_sum = np.zeros(n_face, dtype=np.float32)
+        extra_damped_delta_num = np.zeros(n_verts, dtype=np.float32)
+        extra_fusion_den = np.zeros(n_verts, dtype=np.float32)
 
-            if mirror_map is not None and mirror_w > 0.0:
-                for i in range(n_face):
-                    if vis_v[i] < 0.15:
-                        m = int(mirror_map[i])
-                        if m >= 0 and m != i and vis_v[m] > 0.5:
-                            partner_delta_z = float(pts_v[m, 2] - front_pts[m, 2])
-                            z_v[i] = float(front_pts[i, 2]) + mirror_w * partner_delta_z
-                            w_eff[i] = float(fusion_v[m]) * mirror_w
-                            if w_eff[i] > 0.0:
-                                mirrored_transfers += 1
+        for rec in extra_records.values():
+            pts_v = rec["pts"]
+            rel_v = rec["rel"]
+            extra_vis_sum += rel_v["vis_w"][:n_face]
+            fusion_v = rel_v["w"] * (0.35 + 0.65 * rel_v["facing_w"])
+            raw_delta = pts_v[:, 2] - front_pts[:, 2]
 
             if use_anat:
-                raw_delta = z_v - front_pts[:, 2]
                 damped_delta, damped_mask = _huber_damp(raw_delta, huber_delta)
-                huber_stats["huber_damped"] += int(np.sum(damped_mask & (w_eff > 0.0)))
-                z_v = front_pts[:, 2] + damped_delta
-                # Scale secondary-view override authority by anatomical group importance
-                # (structural 1.75x strong vs. fine details 0.65x / unreliable 0.10x front-anchored).
-                w_eff = w_eff * anat_mult
+                huber_stats["huber_damped"] += int(np.sum(damped_mask & (fusion_v > 0.0)))
+                w_eff = fusion_v * anat_mult
+            else:
+                damped_delta = raw_delta
+                w_eff = fusion_v
 
-            z_num += w_eff * z_v
+            extra_damped_delta_num += fusion_v * damped_delta
+            extra_fusion_den += fusion_v
+            z_num += w_eff * (front_pts[:, 2] + damped_delta)
             w_den += w_eff
+
+        # Coverage-aware conditional mirroring across all non-front extra views:
+        # mirror only vertices genuinely unseen across EVERY extra view while the partner half is well covered.
+        if has_extra and mirror_map is not None and mirror_w > 0.0:
+            for i in range(n_face):
+                cov_i = float(extra_vis_sum[i])
+                if cov_i < 0.25:
+                    m = int(mirror_map[i])
+                    if m >= 0 and m != i and float(extra_vis_sum[m]) > 0.50 and float(extra_fusion_den[m]) > 1e-6:
+                        miss_factor = float(1.0 - _smoothstep(0.05, 0.25, np.asarray(cov_i, dtype=np.float32)))
+                        if miss_factor > 0.0:
+                            partner_delta_z = float(extra_damped_delta_num[m] / extra_fusion_den[m])
+                            w_mirror = float(extra_fusion_den[m]) * mirror_w * miss_factor
+                            if use_anat:
+                                w_mirror *= float(anat_mult[i])
+                            if w_mirror > 0.0:
+                                z_num[i] += w_mirror * (float(front_pts[i, 2]) + mirror_w * partner_delta_z)
+                                w_den[i] += w_mirror
+                                mirrored_transfers += 1
 
         merged[:, 2] = z_num / np.maximum(w_den, 1e-6)
 
-        if has_side:
-            merged = _apply_side_2d_profile(
-                merged,
-                neighbors,
-                side["landmarks"],
-                int(side.get("width", 512)),
-                int(side.get("height", 512)),
+        side_entries = [{"view": rec["view"], "rel": rec["rel"]} for rec in extra_records.values() if rec["is_side"]]
+        if side_entries:
+            merged = _fuse_side_2d_profiles(
+                merged=merged,
+                neighbors=neighbors,
+                side_entries=side_entries,
                 enable_reliability_weighting=True,
-                side_rel=rel_side,
                 anat_mult=anat_mult if use_anat else None,
                 secondary_importance=secondary_importance,
                 huber_delta=huber_delta,
@@ -945,46 +1071,49 @@ def reconstruct_face_mesh(
             )
 
         front_dbg = rel_front["w"].astype(np.float32)
-        tq_dbg = rel_3q["w"].astype(np.float32) if rel_3q is not None else None
-        side_dbg = rel_side["w"].astype(np.float32) if rel_side is not None else None
+        view_dbg = {
+            k: (extra_records[k]["rel"]["w"].astype(np.float32) if k in extra_records else None)
+            for k in ("three_quarter", "three_quarter_2", "side", "side_2")
+        }
 
         combined_weights = front_dbg.copy()
-        if tq_dbg is not None:
-            combined_weights = np.maximum(combined_weights, tq_dbg)
-        if side_dbg is not None:
-            combined_weights = np.maximum(combined_weights, side_dbg)
+        for w_arr in view_dbg.values():
+            if w_arr is not None:
+                combined_weights = np.maximum(combined_weights, w_arr)
         combined_weights = np.clip(combined_weights, 0.0, 1.0).astype(np.float32)
     else:
-        if has_3q:
+        tq_z_list = [rec["pts"][:, 2] for rec in extra_records.values() if not rec["is_side"]]
+        if tq_z_list:
+            tq_z = tq_z_list[0] if len(tq_z_list) == 1 else np.mean(tq_z_list, axis=0)
             w_3q = _smoothstep(0.16, 0.50, abs_x_norm) * (1.0 - 0.5 * _smoothstep(0.75, 1.0, abs_x_norm))
-            merged[:, 2] = merged[:, 2] * (1.0 - 0.65 * w_3q) + pts_3q[:, 2] * (0.65 * w_3q)
+            merged[:, 2] = merged[:, 2] * (1.0 - 0.65 * w_3q) + tq_z * (0.65 * w_3q)
 
-        if has_side:
+        side_recs = [rec for rec in extra_records.values() if rec["is_side"]]
+        if side_recs:
+            side_z = side_recs[0]["pts"][:, 2] if len(side_recs) == 1 else np.mean([r["pts"][:, 2] for r in side_recs], axis=0)
             outer_jaw = _smoothstep(0.55, 0.90, abs_x_norm)
             w_jaw = np.clip(outer_jaw * 0.70, 0.0, 1.0)
-            merged[:, 2] = merged[:, 2] * (1.0 - w_jaw) + pts_side[:, 2] * w_jaw
+            merged[:, 2] = merged[:, 2] * (1.0 - w_jaw) + side_z * w_jaw
 
-            merged = _apply_side_2d_profile(
-                merged,
-                neighbors,
-                side["landmarks"],
-                int(side.get("width", 512)),
-                int(side.get("height", 512)),
+            merged = _fuse_side_2d_profiles(
+                merged=merged,
+                neighbors=neighbors,
+                side_entries=[{"view": rec["view"], "rel": None} for rec in side_recs],
                 enable_reliability_weighting=False,
             )
 
         combined_weights = np.ones(n_verts, dtype=np.float32)
         front_dbg = combined_weights
-        tq_dbg = np.ones(n_verts, dtype=np.float32) if has_3q else None
-        side_dbg = np.ones(n_verts, dtype=np.float32) if has_side else None
+        view_dbg = {
+            k: (np.ones(n_verts, dtype=np.float32) if k in extra_records else None)
+            for k in ("three_quarter", "three_quarter_2", "side", "side_2")
+        }
 
     reg_stats = {"max_delta_ratio": 0.0, "soft_clamped": 0}
-    if enable_regularization and (has_3q or has_side):
+    if enable_regularization and has_extra:
         obs_conf = rel_front["w"].copy()
-        if rel_3q is not None:
-            obs_conf = np.maximum(obs_conf, rel_3q["w"])
-        if rel_side is not None:
-            obs_conf = np.maximum(obs_conf, rel_side["w"])
+        for rec in extra_records.values():
+            obs_conf = np.maximum(obs_conf, rec["rel"]["w"])
         if use_anat:
             anat_conf = np.minimum(1.0, anat_mult / max(float(secondary_importance), 1e-4))
             obs_conf = np.clip(obs_conf * anat_conf, 0.0, 1.0)
@@ -1000,7 +1129,7 @@ def reconstruct_face_mesh(
             max_local_displacement=max_local_displacement,
             symmetry_strength=symmetry_strength,
         )
-    elif has_3q or has_side:
+    elif has_extra:
         merged = _laplacian_smooth_z(merged, neighbors, iterations=1)
 
     merged = _smooth_nostril_transition(merged, neighbors, iterations=4)
@@ -1023,35 +1152,57 @@ def reconstruct_face_mesh(
     chin = merged[CHIN_IDX].tolist()
     forehead = merged[FOREHEAD_IDX].tolist()
 
-    dot_234_3q = (
-        float(np.dot(normals_face[LEFT_TEMPLE_IDX], vis_pose_3q["vis_view_dir"]))
-        if vis_pose_3q is not None and n_face > LEFT_TEMPLE_IDX
-        else None
-    )
-    dot_454_3q = (
-        float(np.dot(normals_face[RIGHT_TEMPLE_IDX], vis_pose_3q["vis_view_dir"]))
-        if vis_pose_3q is not None and n_face > RIGHT_TEMPLE_IDX
-        else None
-    )
-    dot_234_side = (
-        float(np.dot(normals_face[LEFT_TEMPLE_IDX], vis_pose_side["vis_view_dir"]))
-        if vis_pose_side is not None and n_face > LEFT_TEMPLE_IDX
-        else None
-    )
-    dot_454_side = (
-        float(np.dot(normals_face[RIGHT_TEMPLE_IDX], vis_pose_side["vis_view_dir"]))
-        if vis_pose_side is not None and n_face > RIGHT_TEMPLE_IDX
-        else None
-    )
+    def _temple_dots(key: str) -> dict | None:
+        rec = extra_records.get(key)
+        if rec is None or n_face <= max(LEFT_TEMPLE_IDX, RIGHT_TEMPLE_IDX):
+            return None
+        vd = rec["vis_pose"]["vis_view_dir"]
+        return {
+            "left_234": round(float(np.dot(normals_face[LEFT_TEMPLE_IDX], vd)), 4),
+            "right_454": round(float(np.dot(normals_face[RIGHT_TEMPLE_IDX], vd)), 4),
+        }
 
     huber_damped = int(huber_stats["huber_damped"])
     max_delta_ratio = float(reg_stats["max_delta_ratio"])
     soft_clamped = int(reg_stats["soft_clamped"])
-    print(
-        f"[YedpFace3D][Phase3] side_occluded={occluded_side}, mirrored_transfers={mirrored_transfers} | "
-        f"huber_damped={huber_damped} | reg_on={bool(enable_regularization)}, "
-        f"max_delta_ratio={max_delta_ratio:.4f}, soft_clamped={soft_clamped}"
+
+    short_labels = (
+        ("three_quarter", "3q"),
+        ("three_quarter_2", "3q2"),
+        ("side", "side"),
+        ("side_2", "side2"),
     )
+    active_yaw_parts = [f"front={vis_pose_front['yaw_eff_deg']:+.1f}deg"]
+    for key, short in short_labels:
+        rec = extra_records.get(key)
+        if rec is not None:
+            active_yaw_parts.append(f"{short}={rec['vis_pose']['yaw_eff_deg']:+.1f}deg")
+
+    print(
+        f"[YedpFace3D][MultiView] Active views: {', '.join(active_yaw_parts)} | "
+        f"mirrored_transfers={mirrored_transfers} | huber_damped={huber_damped} | "
+        f"reg_on={bool(enable_regularization)}, max_delta_ratio={max_delta_ratio:.4f}"
+    )
+
+    side_diag_parts = []
+    for key, short in (("side", "side"), ("side_2", "side2")):
+        rec = extra_records.get(key)
+        if rec is None:
+            continue
+        yaw_s = rec["vis_pose"]["yaw_eff_deg"]
+        cheek_idx = 50 if yaw_s > 0.0 else 280
+        if cheek_idx < n_verts:
+            rel_s = rec["rel"]
+            side_diag_parts.append(
+                f"{short}(yaw={yaw_s:+.1f}deg): vis_cheek(#{cheek_idx}) "
+                f"vis_n={float(rel_s['vis_normal_w'][cheek_idx]):.3f}, "
+                f"mid={float(rel_s['midline_w'][cheek_idx]):.3f}, "
+                f"bnd={float(rel_s['bnd_w'][cheek_idx]):.3f}, "
+                f"cons={float(rel_s['cons_w'][cheek_idx]):.3f}, "
+                f"final={float(rel_s['w'][cheek_idx]):.3f}"
+            )
+    if side_diag_parts:
+        print(f"[YedpFace3D][SideDiag] {' | '.join(side_diag_parts)}")
 
     # Count-normalized anatomical group summary (prevents point-count bias in global statistics)
     anat_group_means = {
@@ -1060,6 +1211,9 @@ def reconstruct_face_mesh(
         "fine_detail": round(float(fine_detail_importance), 3),
         "unreliable": round(float(unreliable_importance), 3),
     }
+
+    occluded_by_view = {k: extra_records[k]["occluded"] if k in extra_records else 0 for k, _ in short_labels}
+    temple_dots_by_view = {k: _temple_dots(k) for k, _ in short_labels}
 
     weight_debug_stats = {
         "enabled": bool(enable_reliability_weighting),
@@ -1075,31 +1229,33 @@ def reconstruct_face_mesh(
         },
         "view_yaws_deg": {
             "front": round(vis_pose_front["yaw_eff_deg"], 2),
-            "three_quarter": round(vis_pose_3q["yaw_eff_deg"], 2) if vis_pose_3q is not None else None,
-            "side": round(vis_pose_side["yaw_eff_deg"], 2) if vis_pose_side is not None else None,
+            "three_quarter": round(extra_records["three_quarter"]["vis_pose"]["yaw_eff_deg"], 2) if "three_quarter" in extra_records else None,
+            "three_quarter_2": round(extra_records["three_quarter_2"]["vis_pose"]["yaw_eff_deg"], 2) if "three_quarter_2" in extra_records else None,
+            "side": round(extra_records["side"]["vis_pose"]["yaw_eff_deg"], 2) if "side" in extra_records else None,
+            "side_2": round(extra_records["side_2"]["vis_pose"]["yaw_eff_deg"], 2) if "side_2" in extra_records else None,
         },
         "matrix_yaws_deg": {
             "front": round(vis_pose_front["yaw_mat_deg"], 2),
-            "three_quarter": round(vis_pose_3q["yaw_mat_deg"], 2) if vis_pose_3q is not None else None,
-            "side": round(vis_pose_side["yaw_mat_deg"], 2) if vis_pose_side is not None else None,
+            "three_quarter": round(extra_records["three_quarter"]["vis_pose"]["yaw_mat_deg"], 2) if "three_quarter" in extra_records else None,
+            "three_quarter_2": round(extra_records["three_quarter_2"]["vis_pose"]["yaw_mat_deg"], 2) if "three_quarter_2" in extra_records else None,
+            "side": round(extra_records["side"]["vis_pose"]["yaw_mat_deg"], 2) if "side" in extra_records else None,
+            "side_2": round(extra_records["side_2"]["vis_pose"]["yaw_mat_deg"], 2) if "side_2" in extra_records else None,
         },
         "view_pitches_deg": {
             "front": round(front_pose["pitch_deg"], 2),
-            "three_quarter": round(pose_3q["pitch_deg"], 2) if pose_3q is not None else None,
-            "side": round(pose_side["pitch_deg"], 2) if pose_side is not None else None,
+            "three_quarter": round(extra_records["three_quarter"]["pose"]["pitch_deg"], 2) if "three_quarter" in extra_records else None,
+            "three_quarter_2": round(extra_records["three_quarter_2"]["pose"]["pitch_deg"], 2) if "three_quarter_2" in extra_records else None,
+            "side": round(extra_records["side"]["pose"]["pitch_deg"], 2) if "side" in extra_records else None,
+            "side_2": round(extra_records["side_2"]["pose"]["pitch_deg"], 2) if "side_2" in extra_records else None,
         },
-        "temple_dots_3q": (
-            {"left_234": round(dot_234_3q, 4), "right_454": round(dot_454_3q, 4)}
-            if dot_234_3q is not None and dot_454_3q is not None
-            else None
-        ),
-        "temple_dots_side": (
-            {"left_234": round(dot_234_side, 4), "right_454": round(dot_454_side, 4)}
-            if dot_234_side is not None and dot_454_side is not None
-            else None
-        ),
-        "occluded_3q": occluded_3q,
-        "occluded_side": occluded_side,
+        "temple_dots_3q": temple_dots_by_view["three_quarter"],
+        "temple_dots_side": temple_dots_by_view["side"],
+        "temple_dots_by_view": temple_dots_by_view,
+        "occluded_3q": occluded_by_view["three_quarter"],
+        "occluded_3q2": occluded_by_view["three_quarter_2"],
+        "occluded_side": occluded_by_view["side"],
+        "occluded_side2": occluded_by_view["side_2"],
+        "occluded_by_view": occluded_by_view,
         "mirrored_transfers": mirrored_transfers,
         "huber_damped": huber_damped,
         "anatomical_group_counts": anat_group_counts,
@@ -1119,8 +1275,10 @@ def reconstruct_face_mesh(
         "positions": merged.astype(np.float32).ravel().tolist(),
         "uv_front": uv_front.astype(np.float32).ravel().tolist(),
         "indices": tri_arr.astype(np.int32).ravel().tolist(),
-        "has_three_quarter": has_3q,
-        "has_side": has_side,
+        "has_three_quarter": "three_quarter" in extra_records,
+        "has_three_quarter_2": "three_quarter_2" in extra_records,
+        "has_side": "side" in extra_records,
+        "has_side_2": "side_2" in extra_records,
         "anchors": {
             "left_temple": left_temple,
             "right_temple": right_temple,
@@ -1131,8 +1289,10 @@ def reconstruct_face_mesh(
         "landmark_weights_by_view": {
             "combined": combined_weights.tolist(),
             "front": front_dbg.tolist(),
-            "three_quarter": tq_dbg.tolist() if tq_dbg is not None else None,
-            "side": side_dbg.tolist() if side_dbg is not None else None,
+            "three_quarter": view_dbg["three_quarter"].tolist() if view_dbg["three_quarter"] is not None else None,
+            "three_quarter_2": view_dbg["three_quarter_2"].tolist() if view_dbg["three_quarter_2"] is not None else None,
+            "side": view_dbg["side"].tolist() if view_dbg["side"] is not None else None,
+            "side_2": view_dbg["side_2"].tolist() if view_dbg["side_2"] is not None else None,
         },
         "weight_debug_stats": weight_debug_stats,
     }

@@ -264,6 +264,16 @@ class YedpFace3D(io.ComfyNode):
                     optional=True,
                     tooltip="Optional driving video image batch for per-frame facial expression and head pose.",
                 ),
+                io.Image.Input(
+                    "three_quarter_2_image",
+                    optional=True,
+                    tooltip="Optional second 3/4 view photo (e.g. opposite side) for bilateral cheek/temple depth refinement.",
+                ),
+                io.Image.Input(
+                    "side_2_image",
+                    optional=True,
+                    tooltip="Optional second side-profile photo (e.g. opposite profile) for full bilateral jawline and nose depth.",
+                ),
                 io.Float.Input(
                     "depth_weight",
                     default=1.0,
@@ -371,6 +381,8 @@ class YedpFace3D(io.ComfyNode):
         three_quarter_image: torch.Tensor | None = None,
         side_image: torch.Tensor | None = None,
         driving_video: torch.Tensor | None = None,
+        three_quarter_2_image: torch.Tensor | None = None,
+        side_2_image: torch.Tensor | None = None,
     ) -> io.NodeOutput:
         prompt_server = getattr(PromptServer, "instance", None)
         node_id = getattr(cls.hidden, "unique_id", None)
@@ -389,7 +401,9 @@ class YedpFace3D(io.ComfyNode):
                         "job_id": job_id,
                         "front": _tensor_to_data_url(front_image),
                         "three_quarter": _tensor_to_data_url(three_quarter_image),
+                        "three_quarter_2": _tensor_to_data_url(three_quarter_2_image),
                         "side": _tensor_to_data_url(side_image),
+                        "side_2": _tensor_to_data_url(side_2_image),
                         "depth_weight": float(depth_weight),
                         "driving_batch_id": driving_batch_id,
                         "driving_frame_count": len(driving_frames),

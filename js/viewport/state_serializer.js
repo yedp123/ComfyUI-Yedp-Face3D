@@ -1,7 +1,32 @@
 const UPLOAD_SUBFOLDER = "yedp_face3d";
 const IDB_NAME = "yedp_face3d_cache_v1";
 const IDB_STORE = "landmarks";
-const IDB_MAX_ENTRIES = 24;
+const IDB_MAX_ENTRIES = 32;
+
+export const REF_VIEW_KEYS = [
+    "front",
+    "three_quarter",
+    "three_quarter_2",
+    "side",
+    "side_2",
+];
+
+export function createRefSlotMap(initialValue = null) {
+    const map = {};
+    for (const key of REF_VIEW_KEYS) {
+        map[key] = initialValue;
+    }
+    return map;
+}
+
+export function normalizePersistedRefs(rawRefs = null) {
+    const src = rawRefs && typeof rawRefs === "object" ? rawRefs : {};
+    const out = {};
+    for (const key of REF_VIEW_KEYS) {
+        out[key] = src[key] || null;
+    }
+    return out;
+}
 
 let _dbPromise = null;
 

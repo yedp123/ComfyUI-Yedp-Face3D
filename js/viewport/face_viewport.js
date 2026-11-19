@@ -1,8 +1,7 @@
 import { api } from "../../../../scripts/api.js";
 import * as THREE from "../lib/three.module.js";
 import { OrbitControls } from "../lib/OrbitControls.js";
-import { createPlaceholderHead } from "./placeholder_head.js";
-import { ReconstructedFaceMesh } from "./face_mesh.js";
+import { getCanonicalFaceData, getHeadShellRig, ReconstructedFaceMesh } from "./face_mesh.js";
 import { renderAndUploadPasses } from "./offscreen_renderer.js";
 import { stopViewportEvents } from "./ui_icons.js";
 import {
@@ -15,10 +14,13 @@ import {
 import { MotionDriver } from "../vision/motion_driver.js";
 import {
     buildRefViewUrl,
+    createRefSlotMap,
     getCachedLandmarks,
     getRefCacheKey,
+    normalizePersistedRefs,
     packCameraPose,
     packSnapshotPose,
+    REF_VIEW_KEYS,
     setCachedLandmarks,
     unpackCameraPose,
     unpackSnapshotPose,
@@ -52,7 +54,8 @@ export class FaceViewport {
         this.disposed = false;
         this.rafId = null;
         this.resizeObserver = null;
-        this.viewMode = "textured";
+        this.viewMode = "clay";
+        this.isDefaultHead = false;
         this.guidesVisible = true;
         this.enableReliabilityWeighting = true;
         this.enableAnatomicalWeighting = true;
@@ -75,13 +78,13 @@ export class FaceViewport {
         this.outputWidth = 512;
         this.outputHeight = 512;
 
-        this.refUrls = { front: null, three_quarter: null, side: null };
-        this.persistedRefs = { front: null, three_quarter: null, side: null };
-        this.extractedViews = { front: null, three_quarter: null, side: null };
+        this.refUrls = createRefSlotMap(null);
+        this.persistedRefs = createRefSlotMap(null);
+        this.extractedViews = createRefSlotMap(null);
         this.lastPythonSyncedRefs = null;
         this.loadToken = 0;
         this.resetToken = 0;
-        this.viewTokens = { front: 0, three_quarter: 0, side: 0 };
+        this.viewTokens = createRefSlotMap(0);
         this.reconstructToken = 0;
         this.pendingRestoredCamera = null;
 
@@ -145,20 +148,83 @@ export class FaceViewport {
         this.setupLights();
         this.setupGrid();
 
-        this.placeholderHead = createPlaceholderHead();
         this.reconstructedFace = new ReconstructedFaceMesh();
         this.reconstructedFace.group.visible = false;
         this.reconstructedFace.updateLights(this.ui.lightPanel.getState());
         this.reconstructedFace.setRegionWeights(this.ui.weightPanel.getState());
         this.reconstructedFace.setSculptState(this.ui.sculptPanel.getState());
         this.reconstructedFace.applyRenderState(this.renderState);
-        this.scene.add(this.placeholderHead.group, this.reconstructedFace.group);
+        this.scene.add(this.reconstructedFace.group);
 
+        this.ui.refStack.setClearHandler?.((viewKey) => this.clearSingleReference(viewKey));
         this.bindHudEvents();
+        this.setViewMode("clay");
         this.observeResize();
         this.syncSizeFromContainer();
         this.updateRenderUI();
         this.startRenderLoop();
+        this.setStatus("Loading Canonical Head...");
+        this.loadDefaultCanonicalHead();
+    }
+
+    async loadDefaultCanonicalHead() {
+        if (this.disposed) return;
+        const initResetToken = this.resetToken;
+        const initReconstructToken = this.reconstructToken;
+
+        try {
+            const [shellRig, canonicalData] = await Promise.all([
+                getHeadShellRig(),
+                getCanonicalFaceData(),
+            ]);
+            if (
+                this.disposed
+                || initResetToken !== this.resetToken
+                || initReconstructToken !== this.reconstructToken
+                || this.extractedViews.front
+            ) {
+                return;
+            }
+
+            this.reconstructedFace.setSculptState(this.ui.sculptPanel.getState());
+            this.reconstructedFace.setRegionWeights(this.ui.weightPanel.getState());
+            await this.reconstructedFace.updateFromReconstruction(canonicalData, null, shellRig);
+            if (
+                this.disposed
+                || initResetToken !== this.resetToken
+                || initReconstructToken !== this.reconstructToken
+                || this.extractedViews.front
+            ) {
+                return;
+            }
+
+            this.isDefaultHead = true;
+            this.reconstructedFace.setGuidesVisible(this.guidesVisible);
+            this.reconstructedFace.setViewMode(this.viewMode);
+            this.reconstructedFace.setWeightDebugView(this.weightDebugView);
+            this.reconstructedFace.setWeightDebugVisible(this.weightDebugEnabled);
+            this.syncWeightDebugButtons();
+            this.reconstructedFace.applyRenderState(this.renderState);
+            this.reconstructedFace.group.visible = true;
+
+            if (this.snapshotActive && this.snapshotPose?.motionFrame) {
+                this.reconstructedFace.applyMotionFrame(this.snapshotPose.motionFrame);
+            }
+            if (this.pendingRestoredCamera) {
+                const pendingCam = this.pendingRestoredCamera;
+                this.pendingRestoredCamera = null;
+                this.applyCameraPoseState(pendingCam);
+            } else {
+                this.fitHeadToView();
+            }
+
+            this.setStatus("Default Canonical Head (Load Front Photo)");
+            console.log("[YedpFace3D] Loaded default canonical clay head (478 verts + head_shell.glb, instant offline)");
+        } catch (err) {
+            if (!this.disposed) {
+                console.warn("[YedpFace3D] Failed to load default canonical head:", err);
+            }
+        }
     }
 
     createRenderer(canvas) {
@@ -323,7 +389,7 @@ export class FaceViewport {
         );
         this.weightDebugViewBtn = makeToggle(
             "All",
-            "Cycle Weight Debug view (All | 3Q | Side | Front)"
+            "Cycle Weight Debug view (All | Front | 3Q A | 3Q B | Side A | Side B)"
         );
         this.relWeightBtn = makeToggle(
             "Rel. Weight: ON",
@@ -382,10 +448,11 @@ export class FaceViewport {
 
     getAvailableWeightDebugViews() {
         const byView = this.reconstructedFace?.landmarkWeightsByView;
-        const views = ["combined"];
+        const views = ["combined", "front"];
         if (byView?.three_quarter || this.extractedViews.three_quarter) views.push("three_quarter");
+        if (byView?.three_quarter_2 || this.extractedViews.three_quarter_2) views.push("three_quarter_2");
         if (byView?.side || this.extractedViews.side) views.push("side");
-        views.push("front");
+        if (byView?.side_2 || this.extractedViews.side_2) views.push("side_2");
         return views;
     }
 
@@ -406,9 +473,11 @@ export class FaceViewport {
     syncWeightDebugButtons() {
         const viewLabels = {
             combined: "All",
-            three_quarter: "3Q",
-            side: "Side",
             front: "Front",
+            three_quarter: "3Q A",
+            three_quarter_2: "3Q B",
+            side: "Side A",
+            side_2: "Side B",
         };
         if (this.weightDebugBtn) {
             const active = this.weightDebugEnabled;
@@ -495,7 +564,6 @@ export class FaceViewport {
     setViewMode(mode) {
         this.viewMode = mode;
         this.ui.modeBar.setActiveMode(mode);
-        this.placeholderHead?.setWireframe(mode === "wireframe");
         this.reconstructedFace?.setViewMode(mode);
     }
 
@@ -654,13 +722,11 @@ export class FaceViewport {
     }
 
     fitHeadToView(stateOverride = null) {
-        if (!this.controls) return;
+        if (!this.controls || !this.reconstructedFace?.hasMesh) return;
         const rs = stateOverride || this.ui.renderPanel.getState();
         this.renderState = { ...rs };
 
-        const box = this.reconstructedFace.hasMesh
-            ? this.reconstructedFace.getWorldBoundingBox()
-            : new THREE.Box3().setFromObject(this.placeholderHead.group);
+        const box = this.reconstructedFace.getWorldBoundingBox();
         if (box.isEmpty()) return;
 
         const size = box.getSize(new THREE.Vector3());
@@ -705,7 +771,6 @@ export class FaceViewport {
             } else {
                 this.reconstructedFace.resetPose();
             }
-            this.placeholderHead.group.rotation.set(0, 0, 0);
             this.updateRenderUI();
             return;
         }
@@ -1061,14 +1126,51 @@ export class FaceViewport {
             this.persistedRefs[viewKey] = null;
             this.extractedViews[viewKey] = null;
             this.ui.refStack.setPreview(viewKey, null, false);
+            this.updateRefButtonsUI();
             this.setStatus(`Error: ${err.message}`, true);
+        }
+    }
+
+    async clearSingleReference(viewKey) {
+        if (this.disposed || !REF_VIEW_KEYS.includes(viewKey)) return;
+        const resetToken = this.resetToken;
+        this.viewTokens[viewKey] = (this.viewTokens[viewKey] || 0) + 1;
+        this.loadToken++;
+        this.reconstructToken++;
+        this.lastPythonSyncedRefs = null;
+        this.refUrls[viewKey] = null;
+        this.persistedRefs[viewKey] = null;
+        this.extractedViews[viewKey] = null;
+        this.ui.refStack.setPreview(viewKey, null, false);
+        this.updateRefButtonsUI();
+
+        if (this.weightDebugView === viewKey) {
+            this.weightDebugView = "combined";
+            this.reconstructedFace?.setWeightDebugView("combined");
+        }
+
+        if (viewKey === "front" || !this.extractedViews.front) {
+            this.isDefaultHead = false;
+            this.reconstructedFace?.clear(false);
+            if (this.reconstructedFace) this.reconstructedFace.group.visible = false;
+            if (this.viewMode === "textured") {
+                this.setViewMode("clay");
+            }
+            await this.loadDefaultCanonicalHead();
+            return;
+        }
+
+        if (resetToken === this.resetToken) {
+            await this.runReconstruction();
         }
     }
 
     async loadReferenceImages({
         front,
         three_quarter = null,
+        three_quarter_2 = null,
         side = null,
+        side_2 = null,
         depth_weight = null,
         driving_batch_id = null,
         driving_frame_count = 0,
@@ -1076,32 +1178,45 @@ export class FaceViewport {
         if (this.disposed) return;
         const resetToken = ++this.resetToken;
         const token = ++this.loadToken;
-        this.persistedRefs = { front: null, three_quarter: null, side: null };
+        this.persistedRefs = createRefSlotMap(null);
 
         if (depth_weight !== null && depth_weight !== undefined) {
             this.depthWeight = Number(depth_weight);
         }
 
-        this.refUrls = { front, three_quarter, side };
-        this.ui.refStack.setPreview("front", front, false);
-        this.ui.refStack.setPreview("three_quarter", three_quarter, false);
-        this.ui.refStack.setPreview("side", side, false);
+        const incoming = {
+            front: front || null,
+            three_quarter,
+            three_quarter_2,
+            side,
+            side_2,
+        };
+        this.refUrls = { ...incoming };
+        for (const key of REF_VIEW_KEYS) {
+            this.viewTokens[key] = (this.viewTokens[key] || 0) + 1;
+            this.ui.refStack.setPreview(key, incoming[key], false);
+        }
         this.setStatus("Extracting landmarks (CPU)...");
 
         try {
-            const [frontData, tqData, sideData] = await Promise.all([
-                front ? extractFaceFromDataUrl(front) : Promise.resolve(null),
-                three_quarter ? extractFaceFromDataUrl(three_quarter) : Promise.resolve(null),
-                side ? extractFaceFromDataUrl(side) : Promise.resolve(null),
-            ]);
+            const extractedList = await Promise.all(
+                REF_VIEW_KEYS.map((key) =>
+                    incoming[key] ? extractFaceFromDataUrl(incoming[key]) : Promise.resolve(null)
+                )
+            );
 
             if (this.disposed || resetToken !== this.resetToken || token !== this.loadToken) return;
+            const frontData = extractedList[0];
             if (!frontData) {
                 this.setStatus("No face in front_image", true);
                 return;
             }
 
-            this.extractedViews = { front: frontData, three_quarter: tqData, side: sideData };
+            const nextViews = createRefSlotMap(null);
+            REF_VIEW_KEYS.forEach((key, idx) => {
+                nextViews[key] = extractedList[idx];
+            });
+            this.extractedViews = nextViews;
             await this.runReconstruction();
 
             if (driving_batch_id && driving_frame_count > 0 && token === this.loadToken) {
@@ -1171,7 +1286,8 @@ export class FaceViewport {
         const token = ++this.reconstructToken;
 
         try {
-            const hadMeshBefore = this.reconstructedFace.hasMesh;
+            const wasDefaultHead = this.isDefaultHead;
+            const hadMeshBefore = this.reconstructedFace.hasMesh && !wasDefaultHead;
             const triangles = await getTesselationTriangles();
             const wState = this.ui.weightPanel?.getState() || {};
             this.syncWeightTrackingFromPanel(wState);
@@ -1181,7 +1297,9 @@ export class FaceViewport {
                 body: JSON.stringify({
                     front: this.extractedViews.front,
                     three_quarter: this.extractedViews.three_quarter,
+                    three_quarter_2: this.extractedViews.three_quarter_2,
                     side: this.extractedViews.side,
+                    side_2: this.extractedViews.side_2,
                     triangles,
                     depth_weight: this.depthWeight,
                     enable_reliability_weighting: this.enableReliabilityWeighting,
@@ -1211,6 +1329,11 @@ export class FaceViewport {
             if (!availDebugViews.includes(this.weightDebugView)) {
                 this.weightDebugView = "combined";
             }
+            this.isDefaultHead = false;
+            if (wasDefaultHead && this.viewMode === "clay") {
+                this.viewMode = "textured";
+                this.ui.modeBar.setActiveMode("textured");
+            }
             this.reconstructedFace.setGuidesVisible(this.guidesVisible);
             this.reconstructedFace.setViewMode(this.viewMode);
             this.reconstructedFace.setWeightDebugView(this.weightDebugView);
@@ -1218,7 +1341,6 @@ export class FaceViewport {
             this.syncWeightDebugButtons();
             this.reconstructedFace.applyRenderState(this.renderState);
 
-            this.placeholderHead.group.visible = false;
             this.reconstructedFace.group.visible = true;
             this.updateRefButtonsUI();
 
@@ -1230,14 +1352,20 @@ export class FaceViewport {
                 const pendingCam = this.pendingRestoredCamera;
                 this.pendingRestoredCamera = null;
                 this.applyCameraPoseState(pendingCam);
-            } else if (!hadMeshBefore) {
+            } else if (!hadMeshBefore && !wasDefaultHead) {
                 this.fitHeadToView();
             }
 
             const views = ["Front"];
-            if (meshData.has_three_quarter) views.push("3/4 depth");
-            if (meshData.has_side) views.push("Side depth");
-            this.setStatus(`3D Face Ready (${views.join(" + ")})`);
+            if (meshData.has_three_quarter) views.push("3/4 A");
+            if (meshData.has_three_quarter_2) views.push("3/4 B");
+            if (meshData.has_side) views.push("Side A");
+            if (meshData.has_side_2) views.push("Side B");
+            this.setStatus(
+                views.length <= 3
+                    ? `3D Face Ready (${views.join(" + ")})`
+                    : `3D Face Ready (${views.length} views · ${views.join(" + ")})`
+            );
         } catch (err) {
             if (this.disposed || token !== this.reconstructToken) return;
             console.error("[YedpFace3D] Reconstruction failed:", err);
@@ -1251,7 +1379,9 @@ export class FaceViewport {
             job_id,
             front = null,
             three_quarter = null,
+            three_quarter_2 = null,
             side = null,
+            side_2 = null,
             depth_weight = null,
             driving_batch_id = null,
             driving_frame_count = 0,
@@ -1281,7 +1411,9 @@ export class FaceViewport {
                 const sameRefs = this.lastPythonSyncedRefs
                     && this.lastPythonSyncedRefs.front === front
                     && this.lastPythonSyncedRefs.three_quarter === three_quarter
+                    && this.lastPythonSyncedRefs.three_quarter_2 === three_quarter_2
                     && this.lastPythonSyncedRefs.side === side
+                    && this.lastPythonSyncedRefs.side_2 === side_2
                     && Number(this.lastPythonSyncedRefs.depth_weight) === Number(depth_weight)
                     && this.reconstructedFace.hasMesh;
 
@@ -1289,12 +1421,21 @@ export class FaceViewport {
                     await this.loadReferenceImages({
                         front,
                         three_quarter,
+                        three_quarter_2,
                         side,
+                        side_2,
                         depth_weight,
                         driving_batch_id: needDrivingDecode ? driving_batch_id : null,
                         driving_frame_count: needDrivingDecode ? driving_frame_count : 0,
                     });
-                    this.lastPythonSyncedRefs = { front, three_quarter, side, depth_weight };
+                    this.lastPythonSyncedRefs = {
+                        front,
+                        three_quarter,
+                        three_quarter_2,
+                        side,
+                        side_2,
+                        depth_weight,
+                    };
                 } else if (needDrivingDecode) {
                     await this.loadDrivingBatch(driving_batch_id, driving_frame_count, this.loadToken);
                 }
@@ -1317,7 +1458,7 @@ export class FaceViewport {
                     controlsTarget: this.controls.target,
                     grid: this.grid,
                     reconstructedFace: this.reconstructedFace,
-                    placeholderHead: this.placeholderHead,
+                    placeholderHead: null,
                     motionClip: this.recordedClip,
                     snapshotFrame: this.snapshotActive ? this.snapshotPose?.motionFrame : null,
                     turntableFrames: turntable_frames,
@@ -1348,9 +1489,9 @@ export class FaceViewport {
     }
 
     updateRefButtonsUI() {
-        this.ui.refStack.setSlotActive("front", Boolean(this.extractedViews.front));
-        this.ui.refStack.setSlotActive("three_quarter", Boolean(this.extractedViews.three_quarter));
-        this.ui.refStack.setSlotActive("side", Boolean(this.extractedViews.side));
+        for (const key of REF_VIEW_KEYS) {
+            this.ui.refStack.setSlotActive(key, Boolean(this.extractedViews[key]));
+        }
     }
 
     clearAllReferences() {
@@ -1366,9 +1507,12 @@ export class FaceViewport {
         this.clearSnapshot();
         resetImageLandmarker();
 
-        this.refUrls = { front: null, three_quarter: null, side: null };
-        this.persistedRefs = { front: null, three_quarter: null, side: null };
-        this.extractedViews = { front: null, three_quarter: null, side: null };
+        this.refUrls = createRefSlotMap(null);
+        this.persistedRefs = createRefSlotMap(null);
+        this.extractedViews = createRefSlotMap(null);
+        for (const key of REF_VIEW_KEYS) {
+            this.viewTokens[key] = (this.viewTokens[key] || 0) + 1;
+        }
         this.ui.refStack.clearAll();
 
         this.ui.sculptPanel.reset(false);
@@ -1393,13 +1537,13 @@ export class FaceViewport {
         this.reconstructedFace.applyRenderState(this.renderState);
         this.reconstructedFace.group.visible = false;
 
-        this.placeholderHead.group.visible = true;
-        this.placeholderHead.group.rotation.set(0, 0, 0);
+        this.isDefaultHead = false;
+        this.setViewMode("clay");
         this.resetCamera();
         this.updateRefButtonsUI();
         this.updateMotionUI();
         this.updateRenderUI();
-        this.setStatus("Yedp Face3D · Placeholder");
+        this.loadDefaultCanonicalHead();
     }
 
     exportSerializableState() {
@@ -1414,11 +1558,7 @@ export class FaceViewport {
                 smoothEnabled: Boolean(this.reconstructedFace?.smoothEnabled ?? true),
                 guidesVisible: this.guidesVisible,
             },
-            refs: {
-                front: this.persistedRefs.front,
-                three_quarter: this.persistedRefs.three_quarter,
-                side: this.persistedRefs.side,
-            },
+            refs: normalizePersistedRefs(this.persistedRefs),
             camera: packCameraPose(this.captureCameraPose()),
             snapshot: packSnapshotPose(this.snapshotPose),
             snapshotActive: Boolean(this.snapshotActive),
@@ -1477,37 +1617,38 @@ export class FaceViewport {
         this.snapshotPose = unpackSnapshotPose(saved.snapshot, THREE);
         this.snapshotActive = Boolean(saved.snapshotActive && this.snapshotPose);
 
-        const refs = saved.refs || {};
-        const views = ["front", "three_quarter", "side"];
+        const refs = normalizePersistedRefs(saved.refs);
         const hasFront = Boolean(refs.front?.filename);
         this.pendingRestoredCamera = hasFront ? camPose : null;
 
-        this.persistedRefs = {
-            front: refs.front || null,
-            three_quarter: refs.three_quarter || null,
-            side: refs.side || null,
-        };
+        this.persistedRefs = { ...refs };
 
         const urls = {};
-        for (const key of views) {
+        let hasAnyUrl = false;
+        for (const key of REF_VIEW_KEYS) {
             const url = buildRefViewUrl(refs[key], api);
             urls[key] = url;
+            if (url) hasAnyUrl = true;
             this.refUrls[key] = url;
             this.ui.refStack.setPreview(key, url, false);
         }
 
-        if (!hasFront && !urls.three_quarter && !urls.side) {
+        if (!hasAnyUrl) {
+            if (!vp.viewMode) {
+                this.setViewMode("clay");
+            }
             this.updateRefButtonsUI();
             this.updateMotionUI();
             this.updateRenderUI();
             this.updateReadout();
+            await this.loadDefaultCanonicalHead();
             return;
         }
 
         this.setStatus("Restoring saved 3D face...");
         try {
             const restored = await Promise.all(
-                views.map(async (key) => {
+                REF_VIEW_KEYS.map(async (key) => {
                     const url = urls[key];
                     if (!url) return null;
                     const cacheKey = getRefCacheKey(refs[key]);
@@ -1522,11 +1663,11 @@ export class FaceViewport {
             );
             if (this.disposed || resetToken !== this.resetToken) return;
 
-            this.extractedViews = {
-                front: restored[0],
-                three_quarter: restored[1],
-                side: restored[2],
-            };
+            const nextViews = createRefSlotMap(null);
+            REF_VIEW_KEYS.forEach((key, idx) => {
+                nextViews[key] = restored[idx];
+            });
+            this.extractedViews = nextViews;
             this.updateRefButtonsUI();
 
             if (this.extractedViews.front) {
@@ -1537,7 +1678,7 @@ export class FaceViewport {
                 }
             } else {
                 this.pendingRestoredCamera = null;
-                this.setStatus("Load front photo to build mesh");
+                await this.loadDefaultCanonicalHead();
             }
             this.updateMotionUI();
             this.updateRenderUI();
@@ -1583,7 +1724,6 @@ export class FaceViewport {
 
     setGuidesVisible(visible) {
         this.guidesVisible = Boolean(visible);
-        this.placeholderHead?.setGuidesVisible(this.guidesVisible);
         this.reconstructedFace?.setGuidesVisible(this.guidesVisible);
         this.ui.renderPanel?.setGuidesActive(this.guidesVisible);
     }
@@ -1662,8 +1802,6 @@ export class FaceViewport {
             const yawRad = THREE.MathUtils.degToRad(yawDeg);
             if (this.reconstructedFace.hasMesh) {
                 this.reconstructedFace.setTurntableYaw(yawRad);
-            } else {
-                this.placeholderHead.group.rotation.set(0, yawRad, 0);
             }
             const frameIdx = Math.floor(this.turntableCursor) + 1;
             this.ui.renderPanel.renderStatus.textContent = `Turntable F${frameIdx}/${this.turntableFrames} (${Math.round(yawDeg)}°)`;
@@ -1742,10 +1880,6 @@ export class FaceViewport {
         if (this.resizeObserver) {
             this.resizeObserver.disconnect();
             this.resizeObserver = null;
-        }
-        if (this.placeholderHead) {
-            this.placeholderHead.dispose();
-            this.placeholderHead = null;
         }
         if (this.reconstructedFace) {
             this.reconstructedFace.dispose();

@@ -19,8 +19,9 @@ const SKIN_SAMPLE_LANDMARKS = [50, 280, 117, 346, 151, 9, 195];
 
 let _headShellRigPromise = null;
 let _openPoseRigDataPromise = null;
+let _canonicalFaceDataPromise = null;
 
-function getHeadShellRig() {
+export function getHeadShellRig() {
     if (!_headShellRigPromise) {
         const glbUrl = new URL("../../assets/head_shell.glb", import.meta.url).href;
         _headShellRigPromise = fetchWeldedGlbMesh(glbUrl)
@@ -31,6 +32,19 @@ function getHeadShellRig() {
             });
     }
     return _headShellRigPromise;
+}
+
+export function getCanonicalFaceData() {
+    if (!_canonicalFaceDataPromise) {
+        const jsonUrl = new URL("../../assets/canonical_face.json", import.meta.url).href;
+        _canonicalFaceDataPromise = fetch(jsonUrl).then((res) => {
+            if (!res.ok) {
+                throw new Error(`Failed to load canonical_face.json (HTTP ${res.status})`);
+            }
+            return res.json();
+        });
+    }
+    return _canonicalFaceDataPromise;
 }
 
 function getOpenPoseRigData() {
@@ -164,6 +178,7 @@ export class ReconstructedFaceMesh {
         this.group.add(this.depthHullMesh, this.eyeballRig.group, this.weightDebugPoints);
 
         this.frontTexture = null;
+        this.hasTexture = false;
 
         this.basePositions = null;
         this.baseIndices = null;
@@ -200,7 +215,8 @@ export class ReconstructedFaceMesh {
         this.smoothEnabled = true;
         this.guidesVisible = true;
         this.hasMesh = false;
-        this.viewMode = "textured";
+        this.viewMode = "clay";
+        this.material.uniforms.uViewMode.value = 3;
         this.poseMode = "head_face";
         this.poseDotScale = 1.0;
         this.poseOcclude = true;
@@ -239,7 +255,9 @@ export class ReconstructedFaceMesh {
                 combined: Array.isArray(byView.combined) ? new Float32Array(byView.combined) : this.landmarkWeights,
                 front: Array.isArray(byView.front) ? new Float32Array(byView.front) : null,
                 three_quarter: Array.isArray(byView.three_quarter) ? new Float32Array(byView.three_quarter) : null,
+                three_quarter_2: Array.isArray(byView.three_quarter_2) ? new Float32Array(byView.three_quarter_2) : null,
                 side: Array.isArray(byView.side) ? new Float32Array(byView.side) : null,
+                side_2: Array.isArray(byView.side_2) ? new Float32Array(byView.side_2) : null,
             };
         } else {
             this.landmarkWeightsByView = null;
@@ -403,7 +421,7 @@ export class ReconstructedFaceMesh {
     }
 
     setWeightDebugView(viewKey) {
-        const valid = ["combined", "front", "three_quarter", "side"];
+        const valid = ["combined", "front", "three_quarter", "three_quarter_2", "side", "side_2"];
         const next = valid.includes(viewKey) ? viewKey : "combined";
         if (next === this.weightDebugView) return;
         this.weightDebugView = next;
@@ -502,8 +520,16 @@ export class ReconstructedFaceMesh {
         const { tex, skinColor } = await loadTextureFromDataUrl(frontImageUrl, this.baseUvs);
         this.disposeTextures();
         this.frontTexture = tex;
+        this.hasTexture = Boolean(tex);
         this.material.uniforms.uFrontTex.value = tex || this.fallbackTex;
-        if (skinColor) {
+        if (!tex) {
+            this.material.uniforms.uSkinColor.value.setRGB(
+                216 / 255,
+                180 / 255,
+                160 / 255,
+                THREE.SRGBColorSpace
+            );
+        } else if (skinColor) {
             this.material.uniforms.uSkinColor.value.setRGB(
                 skinColor[0],
                 skinColor[1],
@@ -740,7 +766,14 @@ export class ReconstructedFaceMesh {
             this.frontTexture.dispose();
             this.frontTexture = null;
         }
+        this.hasTexture = false;
         this.material.uniforms.uFrontTex.value = this.fallbackTex;
+        this.material.uniforms.uSkinColor.value.setRGB(
+            216 / 255,
+            180 / 255,
+            160 / 255,
+            THREE.SRGBColorSpace
+        );
     }
 
     clear(resetParams = false) {

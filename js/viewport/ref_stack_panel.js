@@ -1,9 +1,15 @@
 import { createSvgIcon, stopViewportEvents } from "./ui_icons.js";
 
-const VIEW_SLOTS = [
-    { key: "front", label: "front" },
-    { key: "three_quarter", label: "three-quarter" },
-    { key: "side", label: "side" },
+const PRIMARY_SLOT = { key: "front", label: "Front", size: 74, iconSize: 28 };
+const PAIR_ROWS = [
+    [
+        { key: "three_quarter", label: "3/4 A", size: 46, iconSize: 18 },
+        { key: "three_quarter_2", label: "3/4 B", size: 46, iconSize: 18 },
+    ],
+    [
+        { key: "side", label: "Side A", size: 46, iconSize: 18 },
+        { key: "side_2", label: "Side B", size: 46, iconSize: 18 },
+    ],
 ];
 
 function readFileAsDataUrl(file) {
@@ -16,51 +22,71 @@ function readFileAsDataUrl(file) {
 }
 
 /**
- * Left-side vertical stack of portrait import/preview slots (`front`, `three-quarter`, `side`)
- * and a prominent full-reset `RESET` button.
+ * Left-side compact reference stack: `Front` on top, followed by `3/4 A/B` and `Side A/B` pairs
+ * with per-slot upload/drop/clear and full `RESET`.
  */
-export function createRefStackPanel({ onSelectFile, onResetAll, onError }) {
+export function createRefStackPanel({ onSelectFile, onClearSlot, onResetAll, onError }) {
+    let clearHandler = onClearSlot || null;
+
     const column = document.createElement("div");
     Object.assign(column.style, {
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
-        gap: "6px",
+        gap: "5px",
         pointerEvents: "auto",
-        width: "84px",
+        width: "100px",
         flexShrink: "0",
     });
     stopViewportEvents(column);
 
     const slots = {};
 
-    for (const { key, label } of VIEW_SLOTS) {
+    function setPreview(viewKey, dataUrl, active = Boolean(dataUrl)) {
+        const slot = slots[viewKey];
+        if (!slot) return;
+        if (dataUrl) {
+            slot.thumb.src = dataUrl;
+            slot.thumb.style.display = "block";
+            slot.uploadIcon.style.display = "none";
+            slot.clearBtn.style.display = "flex";
+            slot.card.style.borderColor = active ? "#38bdf8" : "rgba(255, 255, 255, 0.28)";
+        } else {
+            slot.thumb.removeAttribute("src");
+            slot.thumb.style.display = "none";
+            slot.uploadIcon.style.display = "block";
+            slot.clearBtn.style.display = "none";
+            slot.card.style.borderColor = "rgba(255, 255, 255, 0.14)";
+        }
+    }
+
+    function buildSlotElement({ key, label, size, iconSize }) {
         const item = document.createElement("div");
         Object.assign(item.style, {
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
-            gap: "3px",
-            width: "100%",
+            gap: "2px",
         });
 
         const caption = document.createElement("span");
         caption.textContent = label;
         Object.assign(caption.style, {
-            fontSize: "10px",
+            fontSize: "9px",
             fontWeight: "500",
             color: "#cbd5e1",
             letterSpacing: "0.01em",
             textShadow: "0 1px 2px rgba(0,0,0,0.8)",
             lineHeight: "1.1",
+            whiteSpace: "nowrap",
         });
 
         const card = document.createElement("div");
         Object.assign(card.style, {
             position: "relative",
-            width: "76px",
-            height: "76px",
-            borderRadius: "8px",
+            width: `${size}px`,
+            height: `${size}px`,
+            borderRadius: "7px",
             border: "1px solid rgba(255, 255, 255, 0.14)",
             backgroundColor: "rgba(15, 19, 28, 0.86)",
             display: "flex",
@@ -73,7 +99,7 @@ export function createRefStackPanel({ onSelectFile, onResetAll, onError }) {
         });
         card.title = `Import ${label} portrait`;
 
-        const uploadIcon = createSvgIcon("upload", 30, "#64748b");
+        const uploadIcon = createSvgIcon("upload", iconSize, "#64748b");
 
         const thumb = document.createElement("img");
         thumb.alt = `${label} preview`;
@@ -82,6 +108,38 @@ export function createRefStackPanel({ onSelectFile, onResetAll, onError }) {
             height: "100%",
             objectFit: "cover",
             display: "none",
+        });
+
+        const clearBtn = document.createElement("button");
+        clearBtn.type = "button";
+        clearBtn.textContent = "×";
+        clearBtn.title = `Clear ${label}`;
+        Object.assign(clearBtn.style, {
+            position: "absolute",
+            top: "2px",
+            right: "2px",
+            width: "15px",
+            height: "15px",
+            padding: "0",
+            borderRadius: "4px",
+            border: "1px solid rgba(255, 255, 255, 0.28)",
+            backgroundColor: "rgba(15, 23, 42, 0.85)",
+            color: "#f8fafc",
+            fontSize: "11px",
+            lineHeight: "13px",
+            fontWeight: "700",
+            display: "none",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+            zIndex: "2",
+        });
+        stopViewportEvents(clearBtn);
+        clearBtn.addEventListener("click", async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setPreview(key, null, false);
+            await clearHandler?.(key);
         });
 
         const input = document.createElement("input");
@@ -131,11 +189,28 @@ export function createRefStackPanel({ onSelectFile, onResetAll, onError }) {
             }
         });
 
-        card.append(uploadIcon, thumb, input);
+        card.append(uploadIcon, thumb, clearBtn, input);
         item.append(caption, card);
-        column.appendChild(item);
 
-        slots[key] = { card, uploadIcon, thumb };
+        slots[key] = { card, uploadIcon, thumb, clearBtn };
+        return item;
+    }
+
+    column.appendChild(buildSlotElement(PRIMARY_SLOT));
+
+    for (const pair of PAIR_ROWS) {
+        const row = document.createElement("div");
+        Object.assign(row.style, {
+            display: "flex",
+            flexDirection: "row",
+            justifyContent: "center",
+            gap: "5px",
+            width: "100%",
+        });
+        for (const spec of pair) {
+            row.appendChild(buildSlotElement(spec));
+        }
+        column.appendChild(row);
     }
 
     const resetAllBtn = document.createElement("button");
@@ -143,14 +218,14 @@ export function createRefStackPanel({ onSelectFile, onResetAll, onError }) {
     resetAllBtn.textContent = "RESET";
     resetAllBtn.title = "Clear all portraits, sculpts, weights, mocap clips, and cached state";
     Object.assign(resetAllBtn.style, {
-        width: "76px",
-        marginTop: "4px",
-        padding: "6px 0",
+        width: "96px",
+        marginTop: "2px",
+        padding: "5px 0",
         borderRadius: "6px",
         border: "1px solid rgba(248, 113, 113, 0.45)",
         backgroundColor: "rgba(127, 29, 29, 0.45)",
         color: "#f8fafc",
-        fontSize: "12px",
+        fontSize: "11px",
         fontWeight: "700",
         letterSpacing: "0.08em",
         cursor: "pointer",
@@ -162,26 +237,14 @@ export function createRefStackPanel({ onSelectFile, onResetAll, onError }) {
     });
     column.appendChild(resetAllBtn);
 
-    function setPreview(viewKey, dataUrl, active = Boolean(dataUrl)) {
-        const slot = slots[viewKey];
-        if (!slot) return;
-        if (dataUrl) {
-            slot.thumb.src = dataUrl;
-            slot.thumb.style.display = "block";
-            slot.uploadIcon.style.display = "none";
-            slot.card.style.borderColor = active ? "#38bdf8" : "rgba(255, 255, 255, 0.28)";
-        } else {
-            slot.thumb.removeAttribute("src");
-            slot.thumb.style.display = "none";
-            slot.uploadIcon.style.display = "block";
-            slot.card.style.borderColor = "rgba(255, 255, 255, 0.14)";
-        }
-    }
-
     function setSlotActive(viewKey, active) {
         const slot = slots[viewKey];
         if (!slot) return;
         slot.card.style.borderColor = active ? "#38bdf8" : "rgba(255, 255, 255, 0.14)";
+    }
+
+    function setClearHandler(fn) {
+        clearHandler = typeof fn === "function" ? fn : null;
     }
 
     function clearAll() {
@@ -195,6 +258,7 @@ export function createRefStackPanel({ onSelectFile, onResetAll, onError }) {
         resetAllBtn,
         setPreview,
         setSlotActive,
+        setClearHandler,
         clearAll,
     };
 }
