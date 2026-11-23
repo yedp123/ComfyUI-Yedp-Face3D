@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 import struct
 import threading
@@ -5,9 +6,11 @@ from typing import Iterable
 import uuid
 
 from aiohttp import web
+import folder_paths
 from server import PromptServer
 
 from .face_math import reconstruct_face_mesh
+from .uv_baker import bake_uv_texture
 
 _REGISTERED_EXTENSIONS: set[str] = set()
 _DRIVING_BATCH_CACHE: dict[str, list[str]] = {}
@@ -53,6 +56,25 @@ def pop_render_job(job_id: str) -> dict | None:
         return _RENDER_JOBS.pop(job_id, None)
 
 
+def _resolve_image_ref_path(image_ref: dict | None) -> Path | None:
+    """Safely resolve a persisted ComfyUI image descriptor via folder_paths containment."""
+    if not isinstance(image_ref, dict):
+        return None
+    filename = str(image_ref.get("filename") or "").strip()
+    if not filename or "/" in filename or "\\" in filename or Path(filename).name != filename:
+        return None
+    dir_type = str(image_ref.get("type") or "input").strip()
+    base_dir = folder_paths.get_directory_by_type(dir_type)
+    if not base_dir:
+        return None
+    subfolder = str(image_ref.get("subfolder") or "").strip().lstrip("/\\")
+    candidate = Path(base_dir) / subfolder / filename if subfolder else Path(base_dir) / filename
+    if not folder_paths.is_within_directory(base_dir, str(candidate)):
+        raise ValueError("Image reference path escapes allowed folder directory.")
+    resolved = candidate.resolve()
+    return resolved if resolved.is_file() else None
+
+
 def register_static_routes(package_dir: Path) -> None:
     """Expose js/, models/, assets/, and Face3D API endpoints on PromptServer."""
     prompt_server = getattr(PromptServer, "instance", None)
@@ -88,14 +110,32 @@ def register_static_routes(package_dir: Path) -> None:
                 status=400,
             )
 
+        def _reconstruct_view(raw: dict | None, include_seg_mask: bool = False) -> dict | None:
+            if not isinstance(raw, dict):
+                return raw
+            out = {
+                "landmarks": raw.get("landmarks"),
+                "matrix": raw.get("matrix"),
+                "width": raw.get("width", 512),
+                "height": raw.get("height", 512),
+            }
+            if include_seg_mask:
+                if raw.get("seg_mask_png") is not None:
+                    out["seg_mask_png"] = raw.get("seg_mask_png")
+                if raw.get("seg_mask_rgb") is not None:
+                    out["seg_mask_rgb"] = raw.get("seg_mask_rgb")
+            return out
+
+        raw_silh_fit = payload.get("enable_silhouette_fit")
+        raw_silh_str = payload.get("silhouette_strength")
         try:
             mesh_data = reconstruct_face_mesh(
-                front=front,
+                front=_reconstruct_view(front, include_seg_mask=False),
                 triangles=triangles,
-                three_quarter=payload.get("three_quarter"),
-                three_quarter_2=payload.get("three_quarter_2"),
-                side=payload.get("side"),
-                side_2=payload.get("side_2"),
+                three_quarter=_reconstruct_view(payload.get("three_quarter"), include_seg_mask=False),
+                three_quarter_2=_reconstruct_view(payload.get("three_quarter_2"), include_seg_mask=False),
+                side=_reconstruct_view(payload.get("side"), include_seg_mask=True),
+                side_2=_reconstruct_view(payload.get("side_2"), include_seg_mask=True),
                 depth_weight=float(payload.get("depth_weight", 1.0)),
                 enable_reliability_weighting=bool(payload.get("enable_reliability_weighting", True)),
                 mirror_transfer_weight=float(payload.get("mirror_transfer_weight", 0.85)),
@@ -110,8 +150,69 @@ def register_static_routes(package_dir: Path) -> None:
                 surface_deformation_smoothness=float(payload.get("surface_deformation_smoothness", 0.45)),
                 max_local_displacement=float(payload.get("max_local_displacement", 0.18)),
                 symmetry_strength=float(payload.get("symmetry_strength", 0.0)),
+                enable_silhouette_fit=True if raw_silh_fit is None else bool(raw_silh_fit),
+                silhouette_strength=0.75 if raw_silh_str is None else float(raw_silh_str),
             )
             return web.json_response(mesh_data)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+
+    @prompt_server.routes.post("/yedp_face3d/bake_uv")
+    async def handle_bake_uv(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            return web.json_response({"error": f"Invalid JSON payload: {exc}"}, status=400)
+
+        views_raw = payload.get("views")
+        if not isinstance(views_raw, dict):
+            views_raw = payload
+        triangles = payload.get("triangles")
+        front_raw = views_raw.get("front")
+        if not isinstance(front_raw, dict) or not front_raw.get("landmarks") or not triangles:
+            return web.json_response(
+                {"error": "Missing required 'front.landmarks' or 'triangles'."},
+                status=400,
+            )
+
+        views_clean: dict[str, dict] = {}
+        try:
+            for view_key in ("front", "three_quarter", "three_quarter_2", "side", "side_2"):
+                raw = views_raw.get(view_key)
+                if not isinstance(raw, dict) or not raw.get("landmarks"):
+                    continue
+                entry = {
+                    "landmarks": raw["landmarks"],
+                    "matrix": raw.get("matrix"),
+                    "width": int(raw.get("width", 512)),
+                    "height": int(raw.get("height", 512)),
+                    "seg_mask_png": raw.get("seg_mask_png"),
+                }
+                resolved_path = _resolve_image_ref_path(raw.get("image_ref"))
+                if resolved_path is not None:
+                    entry["image_path"] = resolved_path
+                if raw.get("image_data_url"):
+                    entry["image_data_url"] = raw["image_data_url"]
+                views_clean[view_key] = entry
+
+            atlas_size = max(256, min(2048, int(payload.get("atlas_size", 1024))))
+            debug_size = max(128, min(1024, int(payload.get("debug_size", 512))))
+            enable_color_match = bool(payload.get("enable_color_match", True))
+            enable_seam_blend = bool(payload.get("enable_seam_blend", True))
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                bake_uv_texture,
+                views_clean,
+                triangles,
+                atlas_size,
+                debug_size,
+                enable_color_match,
+                enable_seam_blend,
+            )
+            return web.json_response(result)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
 

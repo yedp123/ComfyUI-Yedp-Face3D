@@ -2,10 +2,15 @@ let _visionPromise = null;
 let _imageLandmarkerPromise = null;
 let _landmarkerResetPromise = null;
 let _videoLandmarkerPromise = null;
+let _imageSegmenterPromise = null;
+let _segWarned = false;
 let _detectCanvas = null;
+let _segInputCanvas = null;
+let _segOutputCanvas = null;
 let _lastVideoTimestampMs = 0;
 
 const DETECT_CANVAS_SIZE = 1024;
+const SEG_CANVAS_SIZE = 256;
 
 function getModelsBaseUrl() {
     return new URL("../../models", import.meta.url).href.replace(/\/$/, "");
@@ -50,6 +55,42 @@ async function getVideoLandmarker() {
         _videoLandmarkerPromise = createLandmarker("VIDEO");
     }
     return _videoLandmarkerPromise;
+}
+
+function warnSegmentationFallback(err) {
+    if (!_segWarned) {
+        _segWarned = true;
+        console.warn(
+            "[YedpFace3D] SelfieMulticlass segmentation unavailable; falling back to visibility-only weights:",
+            err?.message || err
+        );
+    }
+}
+
+async function getImageSegmenter() {
+    if (!_imageSegmenterPromise) {
+        _imageSegmenterPromise = (async () => {
+            const vision = await getVisionLib();
+            if (!vision?.ImageSegmenter) {
+                throw new Error("ImageSegmenter not exported by tasks_vision.js");
+            }
+            const modelsBase = getModelsBaseUrl();
+            const fileset = await vision.FilesetResolver.forVisionTasks(modelsBase);
+            return vision.ImageSegmenter.createFromOptions(fileset, {
+                baseOptions: {
+                    modelAssetPath: `${modelsBase}/selfie_multiclass_256x256.tflite`,
+                    delegate: "CPU",
+                },
+                runningMode: "IMAGE",
+                outputCategoryMask: false,
+                outputConfidenceMasks: true,
+            });
+        })().catch((err) => {
+            warnSegmentationFallback(err);
+            return null;
+        });
+    }
+    return _imageSegmenterPromise;
 }
 
 /**
@@ -163,6 +204,125 @@ async function detectImageDataUrl(dataUrl, required) {
  */
 export async function extractFaceFromDataUrl(dataUrl) {
     return detectImageDataUrl(dataUrl, true);
+}
+
+function getFixedSegCanvases() {
+    if (!_segInputCanvas) {
+        _segInputCanvas = document.createElement("canvas");
+        _segInputCanvas.width = SEG_CANVAS_SIZE;
+        _segInputCanvas.height = SEG_CANVAS_SIZE;
+    }
+    if (!_segOutputCanvas) {
+        _segOutputCanvas = document.createElement("canvas");
+        _segOutputCanvas.width = SEG_CANVAS_SIZE;
+        _segOutputCanvas.height = SEG_CANVAS_SIZE;
+    }
+    return { inputCanvas: _segInputCanvas, outputCanvas: _segOutputCanvas };
+}
+
+function sampleMaskBilinear(arr, w, h, x, y) {
+    if (!arr) return 0;
+    const cx = Math.max(0, Math.min(w - 1, x));
+    const cy = Math.max(0, Math.min(h - 1, y));
+    const x0 = Math.floor(cx);
+    const y0 = Math.floor(cy);
+    const x1 = Math.min(w - 1, x0 + 1);
+    const y1 = Math.min(h - 1, y0 + 1);
+    const fx = cx - x0;
+    const fy = cy - y0;
+    const r0 = y0 * w;
+    const r1 = y1 * w;
+    const v00 = arr[r0 + x0];
+    const v10 = arr[r0 + x1];
+    const v01 = arr[r1 + x0];
+    const v11 = arr[r1 + x1];
+    return (v00 * (1 - fx) + v10 * fx) * (1 - fy) + (v01 * (1 - fx) + v11 * fx) * fy;
+}
+
+/**
+ * Run offline SelfieMulticlass segmentation on a reference image and pack soft probabilities
+ * into a 256x256 RGB PNG data URL (R=face_skin, G=hair, B=non_skin [bg+clothes+others]).
+ */
+export async function segmentImageDataUrl(dataUrl) {
+    if (!dataUrl) return null;
+    let result = null;
+    try {
+        const [segmenter, img] = await Promise.all([
+            getImageSegmenter(),
+            loadImageElement(dataUrl),
+        ]);
+        if (!segmenter) return null;
+
+        const w = img.naturalWidth || img.width || 512;
+        const h = img.naturalHeight || img.height || 512;
+        const size = SEG_CANVAS_SIZE;
+        const scale = Math.min(size / w, size / h);
+        const drawW = w * scale;
+        const drawH = h * scale;
+        const padX = (size - drawW) * 0.5;
+        const padY = (size - drawH) * 0.5;
+
+        const { inputCanvas, outputCanvas } = getFixedSegCanvases();
+        const inCtx = inputCanvas.getContext("2d");
+        inCtx.fillStyle = "#12151c";
+        inCtx.fillRect(0, 0, size, size);
+        inCtx.imageSmoothingEnabled = true;
+        inCtx.imageSmoothingQuality = "high";
+        inCtx.drawImage(img, padX, padY, drawW, drawH);
+
+        result = segmenter.segment(inputCanvas);
+        const masks = result?.confidenceMasks;
+        if (!masks || masks.length < 4) return null;
+
+        const maskW = masks[0].width || size;
+        const maskH = masks[0].height || size;
+        const c0 = masks[0].getAsFloat32Array();
+        const c1 = masks[1].getAsFloat32Array();
+        const c3 = masks[3].getAsFloat32Array();
+        const c4 = masks[4]?.getAsFloat32Array?.() || null;
+        const c5 = masks[5]?.getAsFloat32Array?.() || null;
+
+        const outCtx = outputCanvas.getContext("2d");
+        const imgData = outCtx.createImageData(size, size);
+        const dst = imgData.data;
+        const sxScale = maskW / size;
+        const syScale = maskH / size;
+
+        for (let oy = 0; oy < size; oy++) {
+            const cy = padY + ((oy + 0.5) / size) * drawH;
+            const my = cy * syScale - 0.5;
+            const rowOff = oy * size;
+            for (let ox = 0; ox < size; ox++) {
+                const cx = padX + ((ox + 0.5) / size) * drawW;
+                const mx = cx * sxScale - 0.5;
+
+                const faceSkin = sampleMaskBilinear(c3, maskW, maskH, mx, my);
+                const hair = sampleMaskBilinear(c1, maskW, maskH, mx, my);
+                const bg = sampleMaskBilinear(c0, maskW, maskH, mx, my);
+                const clothes = c4 ? sampleMaskBilinear(c4, maskW, maskH, mx, my) : 0;
+                const others = c5 ? sampleMaskBilinear(c5, maskW, maskH, mx, my) : 0;
+                const nonSkin = Math.max(0, Math.min(1, bg + clothes + others));
+
+                const p = (rowOff + ox) * 4;
+                dst[p] = Math.round(Math.max(0, Math.min(1, faceSkin)) * 255);
+                dst[p + 1] = Math.round(Math.max(0, Math.min(1, hair)) * 255);
+                dst[p + 2] = Math.round(nonSkin * 255);
+                dst[p + 3] = 255;
+            }
+        }
+
+        outCtx.putImageData(imgData, 0, 0);
+        return outputCanvas.toDataURL("image/png");
+    } catch (err) {
+        warnSegmentationFallback(err);
+        return null;
+    } finally {
+        if (result?.confidenceMasks) {
+            for (const m of result.confidenceMasks) {
+                m?.close?.();
+            }
+        }
+    }
 }
 
 /**

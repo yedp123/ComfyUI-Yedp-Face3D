@@ -33,3 +33,19 @@ Facial landmark detection is powered by **[MediaPipe](https://github.com/google-
 
 - **Documentation:** [MediaPipe Face Landmarker](https://developers.google.com/edge/mediapipe/solutions/vision/face_landmarker)
 - **License:** [Apache License 2.0](https://github.com/google-ai-edge/mediapipe/blob/master/LICENSE)
+
+### Silhouette-Guided 3D Face Reconstruction
+
+The constrained side-view silhouette fitting approach in this project draws conceptual inspiration from silhouette- and segmentation-guided 3D face reconstruction research, including:
+
+**[3DDFA-V3: Face Reconstruction with Part-level Representation and Geometric Guidance (CVPR 2024)](https://arxiv.org/abs/2312.00311)** — Zidu Wang et al.
+
+> *This project uses its own sub-pixel scanline silhouette refinement driven by MediaPipe segmentation masks and does not include or redistribute 3DDFA-V3 models or code.*
+
+### Classical Computer Vision & Graphics Foundations
+
+The multi-view UV texture baking, color harmonization, and eyeball shading stages build on established computer graphics and image-processing techniques:
+
+- **Multi-Band (Laplacian Pyramid) Seam Blending:** Based on **[A Multiresolution Spline With Application to Image Mosaics (ACM TOG 1983)](https://persci.mit.edu/pub_pdfs/spline83.pdf)** by Peter J. Burt and Edward H. Adelson, implemented via OpenCV CPU pyramids with frequency-split detail preservation.
+- **Overlap CIE Lab Color Harmonization:** Inspired by **[Color Transfer between Images (IEEE CG&A 2001)](https://www.cs.tau.ac.il/~turkel/imagepapers/ColorTransfer.pdf)** by Erik Reinhard et al., computed strictly across shared, non-hair skin regions.
+- **Three.js & OpenCV:** Powered by **[Three.js](https://threejs.org/)** (MIT License) for real-time WebGL rendering, harmonic cage skinning, and raycast eyeball occlusion blending, and **[OpenCV](https://opencv.org/)** (Apache License 2.0) for CPU UV projection and image processing.

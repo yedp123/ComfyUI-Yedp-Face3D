@@ -2,9 +2,11 @@ import * as THREE from "../lib/three.module.js";
 
 const VERTEX_SHADER = /* glsl */ `
     attribute float aFaceMask;
+    attribute float aScleraBlend;
 
     varying vec2 vUv;
     varying float vFaceMask;
+    varying float vScleraBlend;
     varying vec3 vWorldNormal;
     varying vec3 vViewNormal;
     varying float vViewDepth;
@@ -12,6 +14,7 @@ const VERTEX_SHADER = /* glsl */ `
     void main() {
         vUv = uv;
         vFaceMask = aFaceMask;
+        vScleraBlend = aScleraBlend;
         vWorldNormal = normalize(mat3(modelMatrix) * normal);
         vViewNormal = normalize(normalMatrix * normal);
 
@@ -24,6 +27,9 @@ const VERTEX_SHADER = /* glsl */ `
 const FRAGMENT_SHADER = /* glsl */ `
     uniform sampler2D uFrontTex;
     uniform vec3 uSkinColor;
+    uniform vec3 uScleraColor;
+    uniform float uIrisMaskScale;
+    uniform float uHasTexture;
     uniform float uHasHeadShell;
     uniform int uViewMode;
     uniform float uDepthNear;
@@ -46,6 +52,7 @@ const FRAGMENT_SHADER = /* glsl */ `
 
     varying vec2 vUv;
     varying float vFaceMask;
+    varying float vScleraBlend;
     varying vec3 vWorldNormal;
     varying vec3 vViewNormal;
     varying float vViewDepth;
@@ -85,6 +92,12 @@ const FRAGMENT_SHADER = /* glsl */ `
         vec3 albedo = uHasHeadShell > 0.5
             ? mix(uSkinColor, texAlbedo, maskFactor)
             : texAlbedo;
+        if (uHasTexture > 0.5 && vScleraBlend >= 0.0) {
+            float maskEdge = uIrisMaskScale;
+            float scleraFactor = smoothstep(maskEdge, maskEdge + 0.18, vScleraBlend);
+            float socketShade = mix(1.0, 0.86, smoothstep(maskEdge, maskEdge + 1.4, vScleraBlend));
+            albedo = mix(albedo, uScleraColor * socketShade, scleraFactor);
+        }
         vec3 n = normalize(vWorldNormal);
         float keyDiff = max(dot(n, normalize(uKeyDir)), 0.0);
         float rimDiff = max(dot(n, normalize(uRimDir)), 0.0);
@@ -138,6 +151,9 @@ export function createFaceMaterial(fallbackTex) {
         uniforms: {
             uFrontTex: { value: fallbackTex },
             uSkinColor: { value: new THREE.Color(0xd8b4a0).convertSRGBToLinear() },
+            uScleraColor: { value: new THREE.Color(0xd6d1cb) },
+            uIrisMaskScale: { value: 1.08 },
+            uHasTexture: { value: 0.0 },
             uHasHeadShell: { value: 0.0 },
             uViewMode: { value: 0 },
             uDepthNear: { value: 1.4 },

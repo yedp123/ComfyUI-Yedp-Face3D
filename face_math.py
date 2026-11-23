@@ -1,3 +1,6 @@
+import base64
+
+import cv2
 import numpy as np
 
 # MediaPipe canonical landmark indices used for alignment, scaling, and anatomical anchors
@@ -87,6 +90,20 @@ SAGITTAL_RELIABILITY_PRIORS = {
     13: 0.30, 14: 0.30,           # Inner lip gap (sensitive to mouth parting)
     15: 0.55, 16: 0.55,           # Lower lip surface
     17: 0.85, 18: 0.90, 200: 0.90, 199: 0.92, 175: 0.95, 152: 0.95,
+}
+
+# Anatomical trust weights for constrained 2D side-profile silhouette fitting
+SAGITTAL_SILHOUETTE_TRUST = {
+    10: 0.0, 151: 0.15,           # Upper hairline (bangs/hairline risk)
+    9: 0.55, 8: 0.75,             # Mid-forehead / glabella
+    168: 1.0, 6: 1.0, 197: 1.0, 195: 1.0, 5: 1.0, 4: 1.0, 1: 1.0,
+    19: 0.80, 94: 0.70, 2: 0.55,  # Columella / subnasale
+    164: 0.90, 0: 1.0,            # Philtrum / upper lip peak
+    11: 0.55, 12: 0.25,
+    13: 0.0, 14: 0.0,             # Inner mouth parting (avoid open-mouth/dark-lipstick artifacts)
+    15: 0.25, 16: 0.55,
+    17: 1.0, 18: 0.55,            # Lower lip peak / chin crease
+    200: 1.0, 199: 1.0, 175: 1.0, 152: 1.0,
 }
 
 
@@ -576,6 +593,222 @@ def _smooth_nostril_transition(
     return out
 
 
+def _decode_seg_mask_rgb(view_dict: dict | None) -> np.ndarray | None:
+    """Safely decode 256x256 RGB segmentation mask (R=face_skin, G=hair, B=non_skin)."""
+    if not isinstance(view_dict, dict):
+        return None
+    raw_seg = view_dict.get("seg_mask_rgb")
+    if isinstance(raw_seg, np.ndarray) and raw_seg.ndim == 3 and raw_seg.shape[2] >= 3:
+        if raw_seg.shape[0] >= 2 and raw_seg.shape[1] >= 2:
+            return np.ascontiguousarray(raw_seg[:, :, :3], dtype=np.uint8)
+        return None
+
+    seg_url = view_dict.get("seg_mask_png")
+    if not seg_url or not isinstance(seg_url, str):
+        return None
+    try:
+        b64 = seg_url.split(",", 1)[-1]
+        raw_bytes = np.frombuffer(base64.b64decode(b64), dtype=np.uint8)
+        if raw_bytes.size == 0:
+            return None
+        bgr = cv2.imdecode(raw_bytes, cv2.IMREAD_COLOR)
+        if bgr is None or bgr.ndim != 3 or bgr.shape[2] < 3 or bgr.shape[0] < 2 or bgr.shape[1] < 2:
+            return None
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    except Exception:
+        return None
+
+
+def _extract_side_silhouette_corrections(
+    side_view: dict | None,
+    front_pts: np.ndarray | None,
+    yaw_eff: float,
+    enable_silhouette_fit: bool = True,
+    silhouette_strength: float = 0.75,
+) -> dict:
+    """
+    Extract constrained, pitch-aligned, sub-pixel 2D silhouette shifts along
+    SAGITTAL_PROFILE_INDICES using a side view's SelfieMulticlass mask.
+    """
+    yaw_val = float(yaw_eff) if yaw_eff is not None and np.isfinite(float(yaw_eff)) else 0.0
+    prof_gate = float(_smoothstep(32.0, 42.0, np.asarray(abs(yaw_val), dtype=np.float32)))
+    try:
+        raw_str = float(silhouette_strength)
+    except (TypeError, ValueError):
+        raw_str = 0.0
+    strength = float(np.clip(raw_str, 0.0, 1.0)) if np.isfinite(raw_str) else 0.0
+    n_sag = len(SAGITTAL_PROFILE_INDICES)
+
+    def _skipped() -> dict:
+        return {
+            "active": False,
+            "gate": prof_gate,
+            "applied": 0,
+            "total": n_sag,
+            "hair_skip": 0,
+            "dx_norm": None,
+            "dy_norm": None,
+            "shift_pct": {},
+        }
+
+    if not enable_silhouette_fit or strength <= 0.0 or prof_gate <= 0.01 or not isinstance(side_view, dict):
+        return _skipped()
+
+    lms = side_view.get("landmarks")
+    req_len = max(LEFT_TEMPLE_IDX, RIGHT_TEMPLE_IDX, NOSE_BRIDGE_IDX, NOSE_TIP_IDX, CHIN_IDX, max(SAGITTAL_PROFILE_INDICES)) + 1
+    if not lms or len(lms) < req_len:
+        return _skipped()
+
+    dir_x = 1.0 if (float(lms[NOSE_TIP_IDX]["x"]) > 0.5 * (float(lms[LEFT_TEMPLE_IDX]["x"]) + float(lms[RIGHT_TEMPLE_IDX]["x"]))) else -1.0
+    if (dir_x > 0.0 and yaw_val <= 0.0) or (dir_x < 0.0 and yaw_val >= 0.0):
+        return _skipped()
+
+    seg_rgb = _decode_seg_mask_rgb(side_view)
+    if seg_rgb is None:
+        return _skipped()
+
+    side_width = max(int(side_view.get("width") or 512), 1)
+    side_height = max(int(side_view.get("height") or 512), 1)
+    aspect = float(side_height) / float(side_width)
+
+    p168 = np.array([float(lms[NOSE_BRIDGE_IDX]["x"]), float(lms[NOSE_BRIDGE_IDX]["y"]) * aspect], dtype=np.float32)
+    p152 = np.array([float(lms[CHIN_IDX]["x"]), float(lms[CHIN_IDX]["y"]) * aspect], dtype=np.float32)
+    axis_vec = p152 - p168
+    l_span = float(np.hypot(axis_vec[0], axis_vec[1]))
+    if l_span < 1e-4:
+        return _skipped()
+
+    ax = float(axis_vec[0]) / l_span
+    ay = float(axis_vec[1]) / l_span
+    ux, uy = ay, -ax
+    if abs(ux) < 1e-4:
+        ux, uy = float(dir_x), 0.0
+    elif ux * dir_x < 0.0:
+        ux, uy = -ux, -uy
+
+    # Raycast from -0.10*L_span (inside skin) to +0.16*L_span (outside) in steps of 0.0025*L_span
+    dt_rel = 0.0025
+    n_steps = 105
+    t_ratios = np.linspace(-0.10, 0.16, n_steps, dtype=np.float32)
+    t_vals = t_ratios * np.float32(l_span)
+    h_seg, w_seg = seg_rgb.shape[:2]
+    seg_f32 = seg_rgb.astype(np.float32) * np.float32(1.0 / 255.0)
+
+    sx_grid = np.empty((n_sag, n_steps), dtype=np.float32)
+    sy_grid = np.empty((n_sag, n_steps), dtype=np.float32)
+    inv_aspect = np.float32(1.0 / aspect)
+    for k, idx in enumerate(SAGITTAL_PROFILE_INDICES):
+        lx = float(lms[idx]["x"])
+        ly_m = float(lms[idx]["y"]) * aspect
+        x_ray = np.float32(lx) + t_vals * np.float32(ux)
+        y_ray = (np.float32(ly_m) + t_vals * np.float32(uy)) * inv_aspect
+        # Reuse uv_baker.py pixel-center convention: px = lm * size - 0.5
+        sx_grid[k] = x_ray * np.float32(w_seg) - np.float32(0.5)
+        sy_grid[k] = y_ray * np.float32(h_seg) - np.float32(0.5)
+
+    sampled = cv2.remap(
+        seg_f32,
+        sx_grid,
+        sy_grid,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    face_skin_rays = sampled[:, :, 0]
+    hair_rays = sampled[:, :, 1]
+    non_skin_rays = sampled[:, :, 2]
+
+    hair_win = (t_ratios >= -0.03) & (t_ratios <= 0.05)
+    limit_out = 0.075 * l_span
+    limit_in = 0.045 * l_span
+    raw_shifts = np.zeros(n_sag, dtype=np.float32)
+    confs = np.zeros(n_sag, dtype=np.float32)
+    trusts = np.array([SAGITTAL_SILHOUETTE_TRUST.get(idx, 0.55) for idx in SAGITTAL_PROFILE_INDICES], dtype=np.float32)
+    hair_skip = 0
+
+    for k in range(n_sag):
+        if float(np.max(hair_rays[k, hair_win])) > 0.25:
+            hair_skip += 1
+            continue
+
+        f_ray = face_skin_rays[k]
+        n_ray = non_skin_rays[k]
+        if float(np.max(f_ray)) < 0.45 or not np.any((n_ray >= 0.45) | (f_ray < 0.45)):
+            continue
+
+        signal = f_ray - n_ray
+        for j in range(n_steps - 2, -1, -1):
+            s0 = float(signal[j])
+            s1 = float(signal[j + 1])
+            if s0 >= 0.0 and s1 < 0.0:
+                in_start = max(0, j - 16)
+                out_end = min(n_steps, j + 17)
+                has_skin_in = float(np.max(f_ray[in_start : j + 1])) >= 0.45
+                has_bg_out = bool(np.any((n_ray[j + 1 : out_end] >= 0.45) | (f_ray[j + 1 : out_end] < 0.45)))
+                if not (has_skin_in and has_bg_out):
+                    continue
+                denom = max(s0 - s1, 1e-6)
+                frac = float(np.clip(s0 / denom, 0.0, 1.0))
+                t_edge = float(t_vals[j]) + frac * float(t_vals[j + 1] - t_vals[j])
+                slope_rel = abs(s0 - s1) / dt_rel
+                edge_conf = float(_smoothstep(5.0, 35.0, np.asarray(slope_rel, dtype=np.float32)))
+                if t_edge >= 0.0:
+                    bounded = limit_out * float(np.tanh(t_edge / max(limit_out, 1e-6)))
+                else:
+                    bounded = limit_in * float(np.tanh(t_edge / max(limit_in, 1e-6)))
+                raw_shifts[k] = bounded
+                confs[k] = edge_conf
+                break
+
+    # 2 passes of confidence-weighted 3-tap 1D curve smoothing along SAGITTAL_PROFILE_INDICES
+    eff_w = confs * trusts
+    smoothed = raw_shifts.copy()
+    for _ in range(2):
+        nxt = smoothed.copy()
+        for k in range(n_sag):
+            if eff_w[k] <= 1e-6:
+                continue
+            num = 0.50 * float(eff_w[k]) * float(smoothed[k])
+            den = 0.50 * float(eff_w[k])
+            if k > 0 and eff_w[k - 1] > 1e-6:
+                num += 0.25 * float(eff_w[k - 1]) * float(smoothed[k - 1])
+                den += 0.25 * float(eff_w[k - 1])
+            if k + 1 < n_sag and eff_w[k + 1] > 1e-6:
+                num += 0.25 * float(eff_w[k + 1]) * float(smoothed[k + 1])
+                den += 0.25 * float(eff_w[k + 1])
+            if den > 1e-8:
+                nxt[k] = num / den
+        smoothed = nxt
+
+    n_verts = len(front_pts) if front_pts is not None else len(lms)
+    dx_norm = np.zeros(n_verts, dtype=np.float32)
+    dy_norm = np.zeros(n_verts, dtype=np.float32)
+    shift_pct: dict[int, float] = {}
+    applied = 0
+    global_mult = prof_gate * strength
+
+    for k, idx in enumerate(SAGITTAL_PROFILE_INDICES):
+        if idx >= n_verts:
+            continue
+        w_k = float(confs[k] * trusts[k])
+        final_shift = float(smoothed[k]) * global_mult * w_k
+        shift_pct[idx] = 100.0 * final_shift / l_span
+        if w_k > 1e-4 and global_mult > 1e-4:
+            applied += 1
+            dx_norm[idx] = final_shift * ux
+            dy_norm[idx] = (final_shift * uy) / aspect
+
+    return {
+        "active": applied > 0,
+        "gate": prof_gate,
+        "applied": applied,
+        "total": n_sag,
+        "hair_skip": hair_skip,
+        "dx_norm": dx_norm,
+        "dy_norm": dy_norm,
+        "shift_pct": shift_pct,
+    }
+
+
 def _extract_side_2d_profile_delta(
     merged: np.ndarray,
     side_landmarks: list[dict],
@@ -585,6 +818,7 @@ def _extract_side_2d_profile_delta(
     side_rel: dict | None = None,
     anat_mult: np.ndarray | None = None,
     secondary_importance: float = 1.0,
+    silh_corrections: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """
     Extract scaled and pitch-aligned 2D (Z, Y) sagittal delta_z and reliability alpha
@@ -628,12 +862,19 @@ def _extract_side_2d_profile_delta(
     sag_alpha = np.zeros(n_verts, dtype=np.float32)
     det_w = side_rel["det_w"] if side_rel is not None else None
     bnd_w = side_rel["bnd_w"] if side_rel is not None else None
+    dx_norm = silh_corrections.get("dx_norm") if silh_corrections else None
+    dy_norm = silh_corrections.get("dy_norm") if silh_corrections else None
 
     for idx in SAGITTAL_PROFILE_INDICES:
         if idx >= len(side_landmarks) or idx >= n_face:
             continue
-        raw_z = facing_sign * (float(side_landmarks[idx]["x"]) - bridge_x) * scale
-        raw_y = -(float(side_landmarks[idx]["y"]) - bridge_y) * aspect * scale
+        lx = float(side_landmarks[idx]["x"])
+        ly = float(side_landmarks[idx]["y"])
+        if dx_norm is not None and dy_norm is not None and idx < len(dx_norm):
+            lx += float(dx_norm[idx])
+            ly += float(dy_norm[idx])
+        raw_z = facing_sign * (lx - bridge_x) * scale
+        raw_y = -(ly - bridge_y) * aspect * scale
         rot_z = raw_z * cos_p - raw_y * sin_p
         rot_y = raw_z * sin_p + raw_y * cos_p
         delta_z[idx] = (rot_z + merged[NOSE_BRIDGE_IDX, 2]) - merged[idx, 2]
@@ -663,23 +904,49 @@ def _fuse_side_2d_profiles(
     secondary_importance: float = 1.0,
     huber_delta: float | None = None,
     stats_out: dict | None = None,
+    front_pts: np.ndarray | None = None,
+    enable_silhouette_fit: bool = True,
+    silhouette_strength: float = 0.75,
 ) -> np.ndarray:
     """
     Fuse 1 or more side-profile views along the sagittal midline (with Huber disagreement damping
     when multiple side views are present), then run a single screened Laplacian diffusion pass.
     """
     extracted: list[tuple[np.ndarray, np.ndarray]] = []
-    for entry in side_entries:
+    ref_front = front_pts if front_pts is not None else merged
+    for idx_entry, entry in enumerate(side_entries):
         view_dict = entry["view"]
+        view_key = entry.get("key") or ("side" if idx_entry == 0 else f"side_{idx_entry + 1}")
+        yaw_eff = entry.get("yaw_eff")
+        if yaw_eff is None and view_dict.get("landmarks"):
+            _, _, pose_v = canonicalize_view(
+                view_dict["landmarks"],
+                view_dict.get("matrix"),
+                int(view_dict.get("width") or 512),
+                int(view_dict.get("height") or 512),
+            )
+            yaw_eff = _estimate_effective_visibility_pose(view_dict["landmarks"], pose_v)["yaw_eff_deg"]
+
+        silh = _extract_side_silhouette_corrections(
+            side_view=view_dict,
+            front_pts=ref_front,
+            yaw_eff=0.0 if yaw_eff is None else float(yaw_eff),
+            enable_silhouette_fit=enable_silhouette_fit,
+            silhouette_strength=silhouette_strength,
+        )
+        if stats_out is not None:
+            stats_out.setdefault("silh_by_view", {})[view_key] = silh
+
         res = _extract_side_2d_profile_delta(
             merged=merged,
             side_landmarks=view_dict["landmarks"],
-            side_width=int(view_dict.get("width", 512)),
-            side_height=int(view_dict.get("height", 512)),
+            side_width=int(view_dict.get("width") or 512),
+            side_height=int(view_dict.get("height") or 512),
             enable_reliability_weighting=enable_reliability_weighting,
             side_rel=entry.get("rel"),
             anat_mult=anat_mult,
             secondary_importance=secondary_importance,
+            silh_corrections=silh,
         )
         if res is not None:
             extracted.append(res)
@@ -766,20 +1033,38 @@ def _apply_side_2d_profile(
     secondary_importance: float = 1.0,
     huber_delta: float | None = None,
     stats_out: dict | None = None,
+    seg_mask_png: str | None = None,
+    side_view: dict | None = None,
+    front_pts: np.ndarray | None = None,
+    yaw_eff: float | None = None,
+    enable_silhouette_fit: bool = True,
+    silhouette_strength: float = 0.75,
 ) -> np.ndarray:
     """Single-side wrapper forwarding to _fuse_side_2d_profiles for compatibility."""
+    resolved_view = dict(side_view) if isinstance(side_view, dict) else {
+        "landmarks": side_landmarks,
+        "width": side_width,
+        "height": side_height,
+    }
+    if seg_mask_png is not None and "seg_mask_png" not in resolved_view:
+        resolved_view["seg_mask_png"] = seg_mask_png
     return _fuse_side_2d_profiles(
         merged=merged,
         neighbors=neighbors,
         side_entries=[{
-            "view": {"landmarks": side_landmarks, "width": side_width, "height": side_height},
+            "key": "side",
+            "view": resolved_view,
             "rel": side_rel,
+            "yaw_eff": yaw_eff,
         }],
         enable_reliability_weighting=enable_reliability_weighting,
         anat_mult=anat_mult,
         secondary_importance=secondary_importance,
         huber_delta=huber_delta,
         stats_out=stats_out,
+        front_pts=front_pts,
+        enable_silhouette_fit=enable_silhouette_fit,
+        silhouette_strength=silhouette_strength,
     )
 
 
@@ -889,33 +1174,15 @@ def _regularize_displacement(
     return out, reg_stats
 
 
-def reconstruct_face_mesh(
+def _prepare_view_records(
     front: dict,
     triangles: list[int],
     three_quarter: dict | None = None,
-    side: dict | None = None,
-    depth_weight: float = 1.0,
-    enable_reliability_weighting: bool = True,
-    mirror_transfer_weight: float = 0.85,
-    enable_anatomical_weighting: bool = True,
-    structural_importance: float = 1.75,
-    secondary_importance: float = 1.0,
-    fine_detail_importance: float = 0.65,
-    unreliable_importance: float = 0.10,
-    huber_delta_ratio: float = 0.08,
-    enable_regularization: bool = True,
-    base_geometry_anchoring: float = 0.25,
-    surface_deformation_smoothness: float = 0.45,
-    max_local_displacement: float = 0.18,
-    symmetry_strength: float = 0.0,
     three_quarter_2: dict | None = None,
+    side: dict | None = None,
     side_2: dict | None = None,
 ) -> dict:
-    """
-    Reconstruct a canonical 468/478-vertex textured face mesh from 1-5 MediaPipe views.
-
-    Each view dict expects: {"landmarks": [...], "matrix": [...]|None, "width": int, "height": int}.
-    """
+    """Canonicalize active views, orient face triangles, and compute Phase 1/1.5 view reliability."""
     front_pts, uv_front, front_pose = canonicalize_view(
         front["landmarks"],
         front.get("matrix"),
@@ -930,7 +1197,6 @@ def reconstruct_face_mesh(
     tri_arr = np.asarray(triangles, dtype=np.int32).reshape(-1, 3)
     valid_tri_mask = np.all((tri_arr >= 0) & (tri_arr < n_face), axis=1)
     tri_arr = tri_arr[valid_tri_mask]
-    neighbors = _build_neighbors(n_verts, tri_arr)
     normals_face = _compute_face_normals(front_pts, tri_arr)
 
     face_height = max(float(np.linalg.norm(front_pts[FOREHEAD_IDX] - front_pts[CHIN_IDX])), 1e-4)
@@ -943,11 +1209,6 @@ def reconstruct_face_mesh(
         face_height,
         is_front=True,
     )
-
-    # Front view drives X/Y and texture; extra 3/4 and side views refine 3D Z depth only.
-    merged = front_pts.copy()
-    half_width = max(float(np.max(np.abs(front_pts[:, 0]))), 1e-4)
-    abs_x_norm = np.abs(front_pts[:, 0]) / half_width
 
     extra_view_specs = (
         ("three_quarter", three_quarter, False),
@@ -988,6 +1249,114 @@ def reconstruct_face_mesh(
             "rel": rel_v,
             "occluded": int(np.sum(rel_v["vis_w"][:n_face] < 0.15)),
         }
+
+    return {
+        "front_pts": front_pts,
+        "uv_front": uv_front,
+        "front_pose": front_pose,
+        "vis_pose_front": vis_pose_front,
+        "n_verts": n_verts,
+        "n_face": n_face,
+        "tri_arr": tri_arr,
+        "normals_face": normals_face,
+        "face_height": face_height,
+        "rel_front": rel_front,
+        "extra_records": extra_records,
+    }
+
+
+def compute_view_visibility_weights(
+    views_by_key: dict[str, dict],
+    triangles: list[int],
+) -> dict:
+    """
+    Compute per-view Phase 1/1.5 visibility weights (`vis_w * bnd_w * det_w`) and
+    canonical `abs_x_norm` for UV texture baking without altering 3D reconstruction.
+    """
+    front = views_by_key.get("front")
+    if not front or not front.get("landmarks"):
+        raise ValueError("Missing required 'front' landmarks for visibility weight computation.")
+
+    prep = _prepare_view_records(
+        front=front,
+        triangles=triangles,
+        three_quarter=views_by_key.get("three_quarter"),
+        three_quarter_2=views_by_key.get("three_quarter_2"),
+        side=views_by_key.get("side"),
+        side_2=views_by_key.get("side_2"),
+    )
+    front_pts = prep["front_pts"]
+    half_width = max(float(np.max(np.abs(front_pts[:, 0]))), 1e-4)
+    abs_x_norm = (np.abs(front_pts[:, 0]) / half_width).astype(np.float32)
+
+    def _vis_only(rel: dict) -> np.ndarray:
+        return np.clip(rel["vis_w"] * rel["bnd_w"] * rel["det_w"], 0.0, 1.0).astype(np.float32)
+
+    vis_weights = {"front": _vis_only(prep["rel_front"])}
+    for key, rec in prep["extra_records"].items():
+        vis_weights[key] = _vis_only(rec["rel"])
+
+    return {
+        "vis_weights": vis_weights,
+        "abs_x_norm": abs_x_norm,
+        "front_pts": front_pts,
+    }
+
+
+def reconstruct_face_mesh(
+    front: dict,
+    triangles: list[int],
+    three_quarter: dict | None = None,
+    side: dict | None = None,
+    depth_weight: float = 1.0,
+    enable_reliability_weighting: bool = True,
+    mirror_transfer_weight: float = 0.85,
+    enable_anatomical_weighting: bool = True,
+    structural_importance: float = 1.75,
+    secondary_importance: float = 1.0,
+    fine_detail_importance: float = 0.65,
+    unreliable_importance: float = 0.10,
+    huber_delta_ratio: float = 0.08,
+    enable_regularization: bool = True,
+    base_geometry_anchoring: float = 0.25,
+    surface_deformation_smoothness: float = 0.45,
+    max_local_displacement: float = 0.18,
+    symmetry_strength: float = 0.0,
+    three_quarter_2: dict | None = None,
+    side_2: dict | None = None,
+    enable_silhouette_fit: bool = True,
+    silhouette_strength: float = 0.75,
+) -> dict:
+    """
+    Reconstruct a canonical 468/478-vertex textured face mesh from 1-5 MediaPipe views.
+
+    Each view dict expects: {"landmarks": [...], "matrix": [...]|None, "width": int, "height": int}.
+    """
+    prep = _prepare_view_records(
+        front=front,
+        triangles=triangles,
+        three_quarter=three_quarter,
+        three_quarter_2=three_quarter_2,
+        side=side,
+        side_2=side_2,
+    )
+    front_pts = prep["front_pts"]
+    uv_front = prep["uv_front"]
+    front_pose = prep["front_pose"]
+    vis_pose_front = prep["vis_pose_front"]
+    n_verts = prep["n_verts"]
+    n_face = prep["n_face"]
+    tri_arr = prep["tri_arr"]
+    neighbors = _build_neighbors(n_verts, tri_arr)
+    normals_face = prep["normals_face"]
+    face_height = prep["face_height"]
+    rel_front = prep["rel_front"]
+    extra_records = prep["extra_records"]
+
+    # Front view drives X/Y and texture; extra 3/4 and side views refine 3D Z depth only.
+    merged = front_pts.copy()
+    half_width = max(float(np.max(np.abs(front_pts[:, 0]))), 1e-4)
+    abs_x_norm = np.abs(front_pts[:, 0]) / half_width
 
     mirrored_transfers = 0
     huber_stats = {"huber_damped": 0}
@@ -1057,7 +1426,11 @@ def reconstruct_face_mesh(
 
         merged[:, 2] = z_num / np.maximum(w_den, 1e-6)
 
-        side_entries = [{"view": rec["view"], "rel": rec["rel"]} for rec in extra_records.values() if rec["is_side"]]
+        side_entries = [
+            {"key": key, "view": rec["view"], "rel": rec["rel"], "yaw_eff": rec["vis_pose"]["yaw_eff_deg"]}
+            for key, rec in extra_records.items()
+            if rec["is_side"]
+        ]
         if side_entries:
             merged = _fuse_side_2d_profiles(
                 merged=merged,
@@ -1068,6 +1441,9 @@ def reconstruct_face_mesh(
                 secondary_importance=secondary_importance,
                 huber_delta=huber_delta,
                 stats_out=huber_stats,
+                front_pts=front_pts,
+                enable_silhouette_fit=enable_silhouette_fit,
+                silhouette_strength=silhouette_strength,
             )
 
         front_dbg = rel_front["w"].astype(np.float32)
@@ -1088,9 +1464,9 @@ def reconstruct_face_mesh(
             w_3q = _smoothstep(0.16, 0.50, abs_x_norm) * (1.0 - 0.5 * _smoothstep(0.75, 1.0, abs_x_norm))
             merged[:, 2] = merged[:, 2] * (1.0 - 0.65 * w_3q) + tq_z * (0.65 * w_3q)
 
-        side_recs = [rec for rec in extra_records.values() if rec["is_side"]]
+        side_recs = [(key, rec) for key, rec in extra_records.items() if rec["is_side"]]
         if side_recs:
-            side_z = side_recs[0]["pts"][:, 2] if len(side_recs) == 1 else np.mean([r["pts"][:, 2] for r in side_recs], axis=0)
+            side_z = side_recs[0][1]["pts"][:, 2] if len(side_recs) == 1 else np.mean([r["pts"][:, 2] for _, r in side_recs], axis=0)
             outer_jaw = _smoothstep(0.55, 0.90, abs_x_norm)
             w_jaw = np.clip(outer_jaw * 0.70, 0.0, 1.0)
             merged[:, 2] = merged[:, 2] * (1.0 - w_jaw) + side_z * w_jaw
@@ -1098,8 +1474,15 @@ def reconstruct_face_mesh(
             merged = _fuse_side_2d_profiles(
                 merged=merged,
                 neighbors=neighbors,
-                side_entries=[{"view": rec["view"], "rel": None} for rec in side_recs],
+                side_entries=[
+                    {"key": key, "view": rec["view"], "rel": None, "yaw_eff": rec["vis_pose"]["yaw_eff_deg"]}
+                    for key, rec in side_recs
+                ],
                 enable_reliability_weighting=False,
+                stats_out=huber_stats,
+                front_pts=front_pts,
+                enable_silhouette_fit=enable_silhouette_fit,
+                silhouette_strength=silhouette_strength,
             )
 
         combined_weights = np.ones(n_verts, dtype=np.float32)
@@ -1204,6 +1587,42 @@ def reconstruct_face_mesh(
     if side_diag_parts:
         print(f"[YedpFace3D][SideDiag] {' | '.join(side_diag_parts)}")
 
+    try:
+        silh_str_val = float(silhouette_strength)
+    except (TypeError, ValueError):
+        silh_str_val = 0.0
+    silh_str_clamped = float(np.clip(silh_str_val, 0.0, 1.0)) if np.isfinite(silh_str_val) else 0.0
+    silh_by_view = huber_stats.get("silh_by_view") or {}
+    silh_diag_summary: dict[str, dict] = {}
+    if silh_by_view:
+        silh_parts = []
+        for key, short in (("side", "side"), ("side_2", "side2")):
+            s_res = silh_by_view.get(key)
+            if s_res is None:
+                continue
+            pct = s_res.get("shift_pct") or {}
+            n1 = float(pct.get(1, 0.0))
+            l0 = float(pct.get(0, 0.0))
+            c152 = float(pct.get(152, 0.0))
+            silh_parts.append(
+                f"{short}(gate={s_res['gate']:.2f}, applied={s_res['applied']}/{s_res['total']}, "
+                f"hair_skip={s_res['hair_skip']}, nose1={n1:+.2f}%, lip0={l0:+.2f}%, chin152={c152:+.2f}%)"
+            )
+            silh_diag_summary[key] = {
+                "active": bool(s_res["active"]),
+                "gate": round(float(s_res["gate"]), 3),
+                "applied": int(s_res["applied"]),
+                "hair_skip": int(s_res["hair_skip"]),
+                "nose1_pct": round(n1, 3),
+                "lip0_pct": round(l0, 3),
+                "chin152_pct": round(c152, 3),
+            }
+        if silh_parts:
+            print(
+                f"[YedpFace3D][SilhFit] on={bool(enable_silhouette_fit)} str={silh_str_clamped:.2f} | "
+                + " | ".join(silh_parts)
+            )
+
     # Count-normalized anatomical group summary (prevents point-count bias in global statistics)
     anat_group_means = {
         "structural": round(float(structural_importance), 3),
@@ -1219,6 +1638,11 @@ def reconstruct_face_mesh(
         "enabled": bool(enable_reliability_weighting),
         "anatomical_enabled": bool(use_anat),
         "regularization_enabled": bool(enable_regularization),
+        "silhouette_fit": {
+            "enabled": bool(enable_silhouette_fit),
+            "strength": round(silh_str_clamped, 3),
+            "views": silh_diag_summary,
+        },
         "regularization": {
             "base_geometry_anchoring": round(float(base_geometry_anchoring), 3),
             "surface_deformation_smoothness": round(float(surface_deformation_smoothness), 3),

@@ -10,6 +10,7 @@ import {
     extractFaceFromDataUrl,
     getTesselationTriangles,
     resetImageLandmarker,
+    segmentImageDataUrl,
 } from "../vision/mediapipe_runner.js";
 import { MotionDriver } from "../vision/motion_driver.js";
 import {
@@ -30,6 +31,12 @@ import {
 const DEFAULT_CAMERA_POS = [0, 0.05, 1.85];
 const DEFAULT_TARGET = [0, -0.02, 0];
 const MAX_RECORDED_FRAMES = 600;
+
+function normalizeSilhStrength(raw) {
+    if (raw === null || raw === undefined || raw === "") return 0.75;
+    const num = Number(raw);
+    return Number.isFinite(num) ? Math.max(0, Math.min(1, num)) : 0.75;
+}
 
 function cloneMotionFrame(frame) {
     if (!frame) return null;
@@ -56,10 +63,13 @@ export class FaceViewport {
         this.resizeObserver = null;
         this.viewMode = "clay";
         this.isDefaultHead = false;
+        this._defaultHeadPromise = null;
         this.guidesVisible = true;
         this.enableReliabilityWeighting = true;
         this.enableAnatomicalWeighting = true;
         this.enableRegularization = true;
+        this.mvTexEnabled = true;
+        this.uvDebugMode = "off";
         this.weightDebugEnabled = false;
         this.weightDebugView = "combined";
         this.weightDebugBtn = null;
@@ -67,9 +77,18 @@ export class FaceViewport {
         this.relWeightBtn = null;
         this.anatWeightBtn = null;
         this.regBtn = null;
+        this.mvTexBtn = null;
+        this.uvDebugBtn = null;
         this.regRebuildTimer = null;
+        this.lastBakeResult = null;
+        this.bakeToken = 0;
+        this.lastColorMatch = true;
+        this.lastSeamBlend = true;
+        this.lastSilhFit = true;
+        this.lastSilhStrength = 0.75;
         this.lastRegState = { baseAnchor: 0.25, dispSmooth: 0.45, maxDisp: 0.18, symmetry: 0.0 };
         this.lastMocapWeightState = { eyes: 1.15, brows: 1.0, mouth: 1.0, mouthWidth: 0.55, jaw: 0.85, cheeks: 0.45 };
+        this.lastIrisMaskScale = 1.08;
         this.onGuidesChanged = null;
         this.depthWeight = 1.0;
         this.turntableFrames = 24;
@@ -152,6 +171,7 @@ export class FaceViewport {
         this.reconstructedFace.group.visible = false;
         this.reconstructedFace.updateLights(this.ui.lightPanel.getState());
         this.reconstructedFace.setRegionWeights(this.ui.weightPanel.getState());
+        this.reconstructedFace.setIrisMaskScale(this.ui.weightPanel.getState().irisMaskScale ?? 1.08);
         this.reconstructedFace.setSculptState(this.ui.sculptPanel.getState());
         this.reconstructedFace.applyRenderState(this.renderState);
         this.scene.add(this.reconstructedFace.group);
@@ -167,7 +187,17 @@ export class FaceViewport {
         this.loadDefaultCanonicalHead();
     }
 
-    async loadDefaultCanonicalHead() {
+    loadDefaultCanonicalHead() {
+        const p = this._performLoadDefaultCanonicalHead().finally(() => {
+            if (this._defaultHeadPromise === p) {
+                this._defaultHeadPromise = null;
+            }
+        });
+        this._defaultHeadPromise = p;
+        return p;
+    }
+
+    async _performLoadDefaultCanonicalHead() {
         if (this.disposed) return;
         const initResetToken = this.resetToken;
         const initReconstructToken = this.reconstructToken;
@@ -403,6 +433,14 @@ export class FaceViewport {
             "Reg: ON",
             "Toggle Phase 3 displacement regularization (Base Anchor, Disp Smooth, Max Disp, Symmetry)"
         );
+        this.mvTexBtn = makeToggle(
+            "MV Tex: ON",
+            "Toggle Multi-View UV Texture Baking (ON = Canonical UV Bake, OFF = Original Front Projection)"
+        );
+        this.uvDebugBtn = makeToggle(
+            "UV Debug: Off",
+            "Cycle UV Debug overlay in Textured mode (Off | Source Map | Hair Mask)"
+        );
 
         const debugRow = document.createElement("div");
         Object.assign(debugRow.style, {
@@ -419,6 +457,14 @@ export class FaceViewport {
             gap: "4px",
         });
         phase23Row.append(this.anatWeightBtn, this.regBtn);
+
+        const mvTexRow = document.createElement("div");
+        Object.assign(mvTexRow.style, {
+            display: "flex",
+            alignItems: "center",
+            gap: "4px",
+        });
+        mvTexRow.append(this.mvTexBtn, this.uvDebugBtn);
 
         this.weightDebugBtn.addEventListener("click", (e) => {
             e.stopPropagation();
@@ -440,8 +486,16 @@ export class FaceViewport {
             e.stopPropagation();
             this.setEnableRegularization(!this.enableRegularization);
         });
+        this.mvTexBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.setMvTexEnabled(!this.mvTexEnabled);
+        });
+        this.uvDebugBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.cycleUvDebugMode();
+        });
 
-        bar.append(debugRow, this.relWeightBtn, phase23Row);
+        bar.append(debugRow, this.relWeightBtn, phase23Row, mvTexRow);
         this.ui.hudLayer.appendChild(bar);
         this.syncWeightDebugButtons();
     }
@@ -510,6 +564,179 @@ export class FaceViewport {
             this.regBtn.style.borderColor = on ? "#22c55e" : "#f59e0b";
             this.regBtn.style.color = on ? "#4ade80" : "#fbbf24";
         }
+        const hasMultiView = this.getLoadedViewCount() > 1;
+        const bakedReady = Boolean(this.reconstructedFace?.hasBakedTextures?.());
+        if (this.mvTexBtn) {
+            const on = this.mvTexEnabled;
+            this.mvTexBtn.textContent = on ? "MV Tex: ON" : "MV Tex: OFF";
+            this.mvTexBtn.style.borderColor = on ? "#22c55e" : "#f59e0b";
+            this.mvTexBtn.style.color = on ? "#4ade80" : "#fbbf24";
+        }
+        if (this.uvDebugBtn) {
+            const uvLabels = { off: "Off", source: "Source Map", hair: "Hair Mask" };
+            const canDebug = this.mvTexEnabled && hasMultiView && bakedReady;
+            const activeUv = canDebug ? this.uvDebugMode : "off";
+            this.uvDebugBtn.textContent = `UV Debug: ${uvLabels[activeUv] || "Off"}`;
+            this.uvDebugBtn.disabled = !canDebug;
+            this.uvDebugBtn.style.opacity = canDebug ? "1.0" : "0.5";
+            this.uvDebugBtn.style.cursor = canDebug ? "pointer" : "default";
+            this.uvDebugBtn.style.borderColor = activeUv === "off" ? "rgba(255, 255, 255, 0.16)" : "#38bdf8";
+            this.uvDebugBtn.style.color = activeUv === "off" ? "#cbd5e1" : "#38bdf8";
+        }
+    }
+
+    getLoadedViewCount() {
+        let count = 0;
+        for (const key of REF_VIEW_KEYS) {
+            if (this.extractedViews[key]?.landmarks) count++;
+        }
+        return count;
+    }
+
+    stripSegMaskForReconstruct(extracted, includeSegMask = false) {
+        if (!extracted) return null;
+        const out = {
+            landmarks: extracted.landmarks,
+            matrix: extracted.matrix || null,
+            width: extracted.width,
+            height: extracted.height,
+        };
+        if (includeSegMask) {
+            out.seg_mask_png = extracted.segMaskPng || null;
+        }
+        return out;
+    }
+
+    getBakeSignature() {
+        const parts = REF_VIEW_KEYS.map((k) => {
+            const ext = this.extractedViews[k];
+            if (!ext?.landmarks) return "";
+            const refKey = this.persistedRefs[k]?.filename || `url${this.refUrls[k]?.length || 0}`;
+            const segFlag = ext.segMaskPng ? `s${ext.segMaskPng.length}` : "noseg";
+            return `${k}@${this.viewTokens[k] || 0}:${refKey}:${segFlag}`;
+        });
+        const cmFlag = this.ui.weightPanel?.getState()?.enableColorMatch !== false ? 1 : 0;
+        const sbFlag = this.ui.weightPanel?.getState()?.enableSeamBlend !== false ? 1 : 0;
+        return `${this.resetToken}|cm=${cmFlag}|sb=${sbFlag}|${parts.join("|")}`;
+    }
+
+    async fetchUvBakeData() {
+        if (this.disposed || !this.extractedViews.front || this.getLoadedViewCount() <= 1) {
+            this.lastBakeResult = null;
+            return null;
+        }
+        const sig = this.getBakeSignature();
+        if (this.lastBakeResult?.signature === sig) {
+            return this.lastBakeResult.data;
+        }
+        const token = ++this.bakeToken;
+        const triangles = await getTesselationTriangles();
+        const views = {};
+        for (const key of REF_VIEW_KEYS) {
+            const ext = this.extractedViews[key];
+            if (!ext?.landmarks) continue;
+            const refMeta = this.persistedRefs[key];
+            const entry = {
+                landmarks: ext.landmarks,
+                matrix: ext.matrix || null,
+                width: ext.width,
+                height: ext.height,
+                seg_mask_png: ext.segMaskPng || null,
+            };
+            if (refMeta?.filename) {
+                entry.image_ref = refMeta;
+            }
+            if (!refMeta?.filename && this.refUrls[key]) {
+                entry.image_data_url = this.refUrls[key];
+            }
+            views[key] = entry;
+        }
+        const response = await api.fetchApi("/yedp_face3d/bake_uv", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                views,
+                triangles,
+                atlas_size: 1024,
+                debug_size: 512,
+                enable_color_match: this.ui.weightPanel?.getState()?.enableColorMatch !== false,
+                enable_seam_blend: this.ui.weightPanel?.getState()?.enableSeamBlend !== false,
+            }),
+        });
+        if (!response.ok) {
+            const errBody = await response.json().catch(() => ({}));
+            throw new Error(errBody.error || `UV bake HTTP ${response.status}`);
+        }
+        const bakeJson = await response.json();
+        if (this.disposed || token !== this.bakeToken) return null;
+        const bakeData = {
+            bakedAlbedoUrl: bakeJson.baked_albedo,
+            sourceMapUrl: bakeJson.debug_source_map,
+            hairMaskUrl: bakeJson.debug_hair_mask,
+            stats: bakeJson.stats || null,
+        };
+        this.lastBakeResult = { signature: sig, data: bakeData };
+        return bakeData;
+    }
+
+    async runUvBake({ applyToMesh = true } = {}) {
+        const bakeData = await this.fetchUvBakeData();
+        if (!bakeData || this.disposed) return null;
+        if (applyToMesh && this.reconstructedFace?.hasMesh) {
+            await this.reconstructedFace.setBakedTextures(bakeData);
+            this.reconstructedFace.setMvTexEnabled(this.mvTexEnabled);
+            this.reconstructedFace.setUvDebugMode(this.mvTexEnabled ? this.uvDebugMode : "off");
+            this.syncWeightDebugButtons();
+        }
+        return bakeData;
+    }
+
+    async setMvTexEnabled(enabled) {
+        const next = Boolean(enabled);
+        if (next === this.mvTexEnabled) return;
+        this.mvTexEnabled = next;
+        if (!next) {
+            this.uvDebugMode = "off";
+        }
+        this.reconstructedFace?.setMvTexEnabled(next);
+        this.reconstructedFace?.setUvDebugMode(next ? this.uvDebugMode : "off");
+        this.syncWeightDebugButtons();
+
+        if (next && this.extractedViews.front && this.getLoadedViewCount() > 1 && !this.reconstructedFace?.hasBakedTextures?.()) {
+            const prevStatus = this.ui?.badge?.textContent || "";
+            this.setStatus("Baking Multi-View UV Texture...");
+            try {
+                await this.runUvBake({ applyToMesh: true });
+                if (!this.disposed && prevStatus) {
+                    this.setStatus(prevStatus);
+                }
+            } catch (err) {
+                console.warn("[YedpFace3D] UV bake failed; keeping front texture:", err);
+                if (!this.disposed && prevStatus) {
+                    this.setStatus(prevStatus);
+                }
+            }
+        }
+    }
+
+    cycleUvDebugMode() {
+        if (!this.mvTexEnabled || this.getLoadedViewCount() <= 1 || !this.reconstructedFace?.hasBakedTextures?.()) {
+            return;
+        }
+        const order = ["off", "source", "hair"];
+        const curIdx = order.indexOf(this.uvDebugMode);
+        const next = order[(curIdx + 1) % order.length];
+        this.setUvDebugMode(next);
+    }
+
+    setUvDebugMode(mode) {
+        const valid = ["off", "source", "hair"];
+        this.uvDebugMode = valid.includes(mode) ? mode : "off";
+        if (this.uvDebugMode !== "off" && this.viewMode !== "textured") {
+            this.setViewMode("textured");
+        }
+        this.reconstructedFace?.setUvDebugMode(this.mvTexEnabled ? this.uvDebugMode : "off");
+        this.syncWeightDebugButtons();
     }
 
     setWeightDebugEnabled(enabled) {
@@ -625,10 +852,21 @@ export class FaceViewport {
         for (const k of ["baseAnchor", "dispSmooth", "maxDisp", "symmetry"]) {
             if (weightState[k] !== undefined) this.lastRegState[k] = Number(weightState[k]);
         }
+        this.lastColorMatch = weightState.enableColorMatch !== false;
+        this.lastSeamBlend = weightState.enableSeamBlend !== false;
+        this.lastSilhFit = weightState.enableSilhouetteFit !== false;
+        this.lastSilhStrength = normalizeSilhStrength(weightState.silhouetteStrength);
+        const irisMaskScale = Number(weightState.irisMaskScale ?? 1.08);
+        this.lastIrisMaskScale = Number.isFinite(irisMaskScale) ? irisMaskScale : 1.08;
     }
 
     updateWeights(weightState) {
         if (!weightState) return;
+        const irisMaskScale = Number(weightState.irisMaskScale ?? 1.08);
+        if (Number.isFinite(irisMaskScale) && irisMaskScale !== this.lastIrisMaskScale) {
+            this.lastIrisMaskScale = irisMaskScale;
+            this.reconstructedFace?.setIrisMaskScale(irisMaskScale);
+        }
         let mocapChanged = false;
         for (const k of ["eyes", "brows", "mouth", "mouthWidth", "jaw", "cheeks"]) {
             const v = Number(weightState[k]);
@@ -649,8 +887,44 @@ export class FaceViewport {
                 regChanged = true;
             }
         }
-        if (regChanged && this.extractedViews.front) {
-            this.scheduleReconstruction();
+
+        const silhFit = weightState.enableSilhouetteFit !== false;
+        const silhStrength = normalizeSilhStrength(weightState.silhouetteStrength);
+        const silhFitChanged = silhFit !== this.lastSilhFit;
+        const silhStrengthChanged = silhStrength !== this.lastSilhStrength;
+        if (silhFitChanged || silhStrengthChanged) {
+            this.lastSilhFit = silhFit;
+            this.lastSilhStrength = silhStrength;
+        }
+
+        const colorMatch = weightState.enableColorMatch !== false;
+        const seamBlend = weightState.enableSeamBlend !== false;
+        const uvBakeOptChanged = colorMatch !== this.lastColorMatch || seamBlend !== this.lastSeamBlend;
+        if (uvBakeOptChanged) {
+            this.lastColorMatch = colorMatch;
+            this.lastSeamBlend = seamBlend;
+            this.lastBakeResult = null;
+        }
+
+        if ((regChanged || silhStrengthChanged || silhFitChanged) && this.extractedViews.front) {
+            if (silhFitChanged && !regChanged && !silhStrengthChanged) {
+                if (this.regRebuildTimer !== null) {
+                    clearTimeout(this.regRebuildTimer);
+                    this.regRebuildTimer = null;
+                }
+                this.runReconstruction();
+            } else {
+                this.scheduleReconstruction();
+            }
+        } else if (
+            uvBakeOptChanged
+            && this.extractedViews.front
+            && this.mvTexEnabled
+            && this.getLoadedViewCount() > 1
+        ) {
+            Promise.resolve(this.runUvBake({ applyToMesh: true })).catch((err) => {
+                console.warn("[YedpFace3D][UVBaker] Re-bake on UV option toggle failed:", err);
+            });
         }
     }
 
@@ -1103,11 +1377,17 @@ export class FaceViewport {
             : Promise.resolve(null);
 
         try {
-            const [extracted, refMeta] = await Promise.all([
+            const [extracted, segMaskPng, refMeta] = await Promise.all([
                 extractFaceFromDataUrl(dataUrl),
+                segmentImageDataUrl(dataUrl),
                 uploadPromise,
             ]);
             if (this.disposed || resetToken !== this.resetToken || slotToken !== this.viewTokens[viewKey]) return;
+            if (extracted) {
+                extracted.segMaskPng = segMaskPng || null;
+            }
+            this.lastBakeResult = null;
+            this.bakeToken++;
             this.extractedViews[viewKey] = extracted;
             if (refMeta) {
                 this.persistedRefs[viewKey] = refMeta;
@@ -1137,6 +1417,8 @@ export class FaceViewport {
         this.viewTokens[viewKey] = (this.viewTokens[viewKey] || 0) + 1;
         this.loadToken++;
         this.reconstructToken++;
+        this.bakeToken++;
+        this.lastBakeResult = null;
         this.lastPythonSyncedRefs = null;
         this.refUrls[viewKey] = null;
         this.persistedRefs[viewKey] = null;
@@ -1147,6 +1429,12 @@ export class FaceViewport {
         if (this.weightDebugView === viewKey) {
             this.weightDebugView = "combined";
             this.reconstructedFace?.setWeightDebugView("combined");
+        }
+        if (this.getLoadedViewCount() <= 1) {
+            this.uvDebugMode = "off";
+            this.reconstructedFace?.setUvDebugMode("off");
+            this.reconstructedFace?.clearBakedTextures();
+            this.syncWeightDebugButtons();
         }
 
         if (viewKey === "front" || !this.extractedViews.front) {
@@ -1200,9 +1488,18 @@ export class FaceViewport {
 
         try {
             const extractedList = await Promise.all(
-                REF_VIEW_KEYS.map((key) =>
-                    incoming[key] ? extractFaceFromDataUrl(incoming[key]) : Promise.resolve(null)
-                )
+                REF_VIEW_KEYS.map(async (key) => {
+                    const url = incoming[key];
+                    if (!url) return null;
+                    const [extracted, segMaskPng] = await Promise.all([
+                        extractFaceFromDataUrl(url),
+                        segmentImageDataUrl(url),
+                    ]);
+                    if (extracted) {
+                        extracted.segMaskPng = segMaskPng || null;
+                    }
+                    return extracted;
+                })
             );
 
             if (this.disposed || resetToken !== this.resetToken || token !== this.loadToken) return;
@@ -1216,6 +1513,8 @@ export class FaceViewport {
             REF_VIEW_KEYS.forEach((key, idx) => {
                 nextViews[key] = extractedList[idx];
             });
+            this.lastBakeResult = null;
+            this.bakeToken++;
             this.extractedViews = nextViews;
             await this.runReconstruction();
 
@@ -1295,11 +1594,11 @@ export class FaceViewport {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    front: this.extractedViews.front,
-                    three_quarter: this.extractedViews.three_quarter,
-                    three_quarter_2: this.extractedViews.three_quarter_2,
-                    side: this.extractedViews.side,
-                    side_2: this.extractedViews.side_2,
+                    front: this.stripSegMaskForReconstruct(this.extractedViews.front, false),
+                    three_quarter: this.stripSegMaskForReconstruct(this.extractedViews.three_quarter, false),
+                    three_quarter_2: this.stripSegMaskForReconstruct(this.extractedViews.three_quarter_2, false),
+                    side: this.stripSegMaskForReconstruct(this.extractedViews.side, true),
+                    side_2: this.stripSegMaskForReconstruct(this.extractedViews.side_2, true),
                     triangles,
                     depth_weight: this.depthWeight,
                     enable_reliability_weighting: this.enableReliabilityWeighting,
@@ -1309,6 +1608,8 @@ export class FaceViewport {
                     surface_deformation_smoothness: Number(wState.dispSmooth ?? 0.45),
                     max_local_displacement: Number(wState.maxDisp ?? 0.18),
                     symmetry_strength: Number(wState.symmetry ?? 0.0),
+                    enable_silhouette_fit: wState.enableSilhouetteFit !== false,
+                    silhouette_strength: normalizeSilhStrength(wState.silhouetteStrength),
                 }),
             });
 
@@ -1320,10 +1621,35 @@ export class FaceViewport {
             const meshData = await response.json();
             if (this.disposed || token !== this.reconstructToken) return;
 
+            const shouldBakeUv = this.mvTexEnabled && this.getLoadedViewCount() > 1;
+            let bakeData = null;
+            if (shouldBakeUv) {
+                try {
+                    bakeData = await this.fetchUvBakeData();
+                } catch (bakeErr) {
+                    console.warn("[YedpFace3D] UV bake failed; falling back to front projection:", bakeErr);
+                    bakeData = null;
+                }
+                if (this.disposed || token !== this.reconstructToken) return;
+            } else if (this.getLoadedViewCount() <= 1) {
+                this.lastBakeResult = null;
+                this.uvDebugMode = "off";
+            }
+
             this.reconstructedFace.setSculptState(this.ui.sculptPanel.getState());
             this.reconstructedFace.setRegionWeights(this.ui.weightPanel.getState());
             await this.reconstructedFace.updateFromReconstruction(meshData, this.refUrls.front);
             if (this.disposed || token !== this.reconstructToken) return;
+
+            this.reconstructedFace.setMvTexEnabled(this.mvTexEnabled);
+            if (shouldBakeUv && bakeData) {
+                await this.reconstructedFace.setBakedTextures(bakeData);
+                if (this.disposed || token !== this.reconstructToken) return;
+                this.reconstructedFace.setUvDebugMode(this.uvDebugMode);
+            } else {
+                this.reconstructedFace.clearBakedTextures();
+                this.reconstructedFace.setUvDebugMode("off");
+            }
 
             const availDebugViews = this.getAvailableWeightDebugViews();
             if (!availDebugViews.includes(this.weightDebugView)) {
@@ -1392,6 +1718,15 @@ export class FaceViewport {
         } = detail;
 
         try {
+            if (!front && !this.reconstructedFace?.hasMesh && this._defaultHeadPromise) {
+                try {
+                    await this._defaultHeadPromise;
+                } catch {
+                    // Never hang the export queue if default asset loading failed
+                }
+                if (this.disposed) return;
+            }
+
             this.setGuidesVisible(anatomical_guides);
             this.setOutputResolution(render_width, render_height);
             this.setTurntableFrames(turntable_frames);
@@ -1445,10 +1780,20 @@ export class FaceViewport {
 
             if (this.disposed) return;
 
+            if (this.mvTexEnabled && this.getLoadedViewCount() > 1 && !this.reconstructedFace?.hasBakedTextures?.()) {
+                try {
+                    await this.runUvBake({ applyToMesh: true });
+                } catch (bakeErr) {
+                    console.warn("[YedpFace3D] Pre-export UV bake failed; using front projection:", bakeErr);
+                }
+                if (this.disposed) return;
+            }
+
             this.renderState = this.ui.renderPanel.getState();
             this.setStatus(`Rendering ${render_width}x${render_height}...`);
             this.isExporting = true;
             this.reconstructedFace?.setWeightDebugVisible(false);
+            this.reconstructedFace?.setUvDebugMode("off");
             try {
                 await renderAndUploadPasses({
                     jobId: job_id,
@@ -1473,6 +1818,7 @@ export class FaceViewport {
             } finally {
                 this.isExporting = false;
                 this.reconstructedFace?.setWeightDebugVisible(this.weightDebugEnabled);
+                this.reconstructedFace?.setUvDebugMode(this.mvTexEnabled ? this.uvDebugMode : "off");
             }
 
             this.updateRenderUI();
@@ -1498,6 +1844,8 @@ export class FaceViewport {
         this.resetToken += 1;
         this.loadToken++;
         this.reconstructToken++;
+        this.bakeToken++;
+        this.lastBakeResult = null;
         this.pendingRestoredCamera = null;
         this.lastPythonSyncedRefs = null;
         this.stopWebcam();
@@ -1529,10 +1877,13 @@ export class FaceViewport {
         this.enableReliabilityWeighting = true;
         this.enableAnatomicalWeighting = true;
         this.enableRegularization = true;
+        this.mvTexEnabled = true;
+        this.uvDebugMode = "off";
         this.syncWeightTrackingFromPanel(this.ui.weightPanel.getState());
         this.syncWeightDebugButtons();
         this.reconstructedFace.updateLights(this.ui.lightPanel.getState());
         this.reconstructedFace.setRegionWeights(this.ui.weightPanel.getState());
+        this.reconstructedFace.setIrisMaskScale(this.ui.weightPanel.getState().irisMaskScale ?? 1.08);
         this.reconstructedFace.setSculptState(this.ui.sculptPanel.getState());
         this.reconstructedFace.applyRenderState(this.renderState);
         this.reconstructedFace.group.visible = false;
@@ -1557,6 +1908,10 @@ export class FaceViewport {
                 viewMode: this.viewMode,
                 smoothEnabled: Boolean(this.reconstructedFace?.smoothEnabled ?? true),
                 guidesVisible: this.guidesVisible,
+                enableReliabilityWeighting: Boolean(this.enableReliabilityWeighting),
+                enableAnatomicalWeighting: Boolean(this.enableAnatomicalWeighting),
+                enableRegularization: Boolean(this.enableRegularization),
+                mvTexEnabled: Boolean(this.mvTexEnabled),
             },
             refs: normalizePersistedRefs(this.persistedRefs),
             camera: packCameraPose(this.captureCameraPose()),
@@ -1580,7 +1935,17 @@ export class FaceViewport {
             this.ui.sculptPanel.setState(saved.sculpt, false);
         }
         if (saved.weights && this.ui.weightPanel?.setState) {
-            this.ui.weightPanel.setState(saved.weights, false);
+            this.ui.weightPanel.setState(
+                {
+                    ...saved.weights,
+                    enableSilhouetteFit: saved.weights.enableSilhouetteFit !== false,
+                    silhouetteStrength: normalizeSilhStrength(saved.weights.silhouetteStrength),
+                    enableColorMatch: saved.weights.enableColorMatch !== false,
+                    enableSeamBlend: saved.weights.enableSeamBlend !== false,
+                    irisMaskScale: saved.weights.irisMaskScale ?? 1.08,
+                },
+                false,
+            );
             this.syncWeightTrackingFromPanel(this.ui.weightPanel.getState());
         }
         if (saved.lights && this.ui.lightPanel?.setState) {
@@ -1593,6 +1958,16 @@ export class FaceViewport {
         }
 
         const vp = saved.viewport || {};
+        this.enableReliabilityWeighting = Boolean(vp.enableReliabilityWeighting ?? true);
+        this.enableAnatomicalWeighting = Boolean(vp.enableAnatomicalWeighting ?? true);
+        this.enableRegularization = Boolean(vp.enableRegularization ?? true);
+        this.mvTexEnabled = Boolean(vp.mvTexEnabled ?? true);
+        this.uvDebugMode = "off";
+        this.lastBakeResult = null;
+        this.bakeToken += 1;
+        this.reconstructedFace?.setMvTexEnabled(this.mvTexEnabled);
+        this.syncWeightDebugButtons();
+
         if (vp.viewMode) {
             this.setViewMode(vp.viewMode);
         }
@@ -1606,6 +1981,7 @@ export class FaceViewport {
 
         this.reconstructedFace?.updateLights(this.ui.lightPanel.getState());
         this.reconstructedFace?.setRegionWeights(this.ui.weightPanel.getState());
+        this.reconstructedFace?.setIrisMaskScale(this.ui.weightPanel.getState().irisMaskScale ?? 1.08);
         this.reconstructedFace?.setSculptState(this.ui.sculptPanel.getState());
         this.reconstructedFace?.applyRenderState(this.renderState);
 
@@ -1618,8 +1994,7 @@ export class FaceViewport {
         this.snapshotActive = Boolean(saved.snapshotActive && this.snapshotPose);
 
         const refs = normalizePersistedRefs(saved.refs);
-        const hasFront = Boolean(refs.front?.filename);
-        this.pendingRestoredCamera = hasFront ? camPose : null;
+        this.pendingRestoredCamera = camPose || null;
 
         this.persistedRefs = { ...refs };
 
@@ -1647,14 +2022,29 @@ export class FaceViewport {
 
         this.setStatus("Restoring saved 3D face...");
         try {
-            const restored = await Promise.all(
+            const settled = await Promise.allSettled(
                 REF_VIEW_KEYS.map(async (key) => {
                     const url = urls[key];
                     if (!url) return null;
                     const cacheKey = getRefCacheKey(refs[key]);
                     const cached = await getCachedLandmarks(cacheKey);
-                    if (cached) return cached;
-                    const extracted = await extractFaceFromDataUrl(url);
+                    if (cached) {
+                        if (cached.segMaskPng === undefined) {
+                            const segMaskPng = await segmentImageDataUrl(url);
+                            cached.segMaskPng = segMaskPng || null;
+                            if (cacheKey) {
+                                setCachedLandmarks(cacheKey, cached);
+                            }
+                        }
+                        return cached;
+                    }
+                    const [extracted, segMaskPng] = await Promise.all([
+                        extractFaceFromDataUrl(url),
+                        segmentImageDataUrl(url),
+                    ]);
+                    if (extracted) {
+                        extracted.segMaskPng = segMaskPng || null;
+                    }
                     if (extracted && cacheKey) {
                         setCachedLandmarks(cacheKey, extracted);
                     }
@@ -1665,7 +2055,27 @@ export class FaceViewport {
 
             const nextViews = createRefSlotMap(null);
             REF_VIEW_KEYS.forEach((key, idx) => {
-                nextViews[key] = restored[idx];
+                const outcome = settled[idx];
+                const hadUrl = Boolean(urls[key]);
+                if (outcome.status === "fulfilled" && outcome.value) {
+                    nextViews[key] = outcome.value;
+                } else if (hadUrl) {
+                    nextViews[key] = null;
+                    this.refUrls[key] = null;
+                    this.persistedRefs[key] = null;
+                    this.ui.refStack.setPreview(key, null, false);
+                    if (key === "front") {
+                        console.warn(
+                            "[YedpFace3D] Missing/unreadable front ref during state restore:",
+                            outcome.status === "rejected" ? outcome.reason : "empty result"
+                        );
+                    } else {
+                        console.warn(
+                            `[YedpFace3D] Skipping missing/unreadable auxiliary ref: ${key}`,
+                            outcome.status === "rejected" ? outcome.reason : ""
+                        );
+                    }
+                }
             });
             this.extractedViews = nextViews;
             this.updateRefButtonsUI();
@@ -1677,7 +2087,6 @@ export class FaceViewport {
                     this.reconstructedFace.applyMotionFrame(this.snapshotPose.motionFrame);
                 }
             } else {
-                this.pendingRestoredCamera = null;
                 await this.loadDefaultCanonicalHead();
             }
             this.updateMotionUI();
@@ -1685,9 +2094,11 @@ export class FaceViewport {
             this.updateReadout();
         } catch (err) {
             if (this.disposed || resetToken !== this.resetToken) return;
-            this.pendingRestoredCamera = null;
-            console.warn("[YedpFace3D] State restore failed:", err);
-            this.setStatus(`Restore partial: ${err?.message || err}`, true);
+            console.warn("[YedpFace3D] State restore failed; falling back to default canonical head:", err);
+            await this.loadDefaultCanonicalHead();
+            this.updateMotionUI();
+            this.updateRenderUI();
+            this.updateReadout();
         }
     }
 
@@ -1867,6 +2278,8 @@ export class FaceViewport {
         this.resetToken += 1;
         this.loadToken++;
         this.reconstructToken++;
+        this.bakeToken++;
+        this.lastBakeResult = null;
         if (this.regRebuildTimer !== null) {
             clearTimeout(this.regRebuildTimer);
             this.regRebuildTimer = null;

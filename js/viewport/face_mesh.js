@@ -11,11 +11,12 @@ import { MeshSubdivider } from "./mesh_subdiv.js";
 import { fetchWeldedGlbMesh, fetchOpenPoseRigGlb } from "./glb_loader.js";
 import { HeadShellRig } from "./head_shell_rig.js";
 import { OpenPoseFaceRig } from "./openpose_rig.js";
-import { EyeballRig } from "./eyeball_rig.js";
+import { EYE_SPECS, EyeballRig } from "./eyeball_rig.js";
 
 const _worldCenter = new THREE.Vector3();
 const _dbgColor = new THREE.Color();
 const SKIN_SAMPLE_LANDMARKS = [50, 280, 117, 346, 151, 9, 195];
+const DEFAULT_SCLERA_HEX = 0xd6d1cb;
 
 let _headShellRigPromise = null;
 let _openPoseRigDataPromise = null;
@@ -91,24 +92,127 @@ function sampleMedianSkinColor(img, uvs) {
     }
 }
 
-function loadTextureFromDataUrl(dataUrl, uvs) {
+function medianChannel(values) {
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = sorted.length >> 1;
+    return sorted.length % 2 === 1 ? sorted[mid] : 0.5 * (sorted[mid - 1] + sorted[mid]);
+}
+
+export function clampNaturalScleraRgb(r, g, b) {
+    const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    const maxDev = Math.max(Math.abs(r - luma), Math.abs(g - luma), Math.abs(b - luma));
+    if (maxDev > 0.045) {
+        const satScale = 0.045 / maxDev;
+        r = luma + (r - luma) * satScale;
+        g = luma + (g - luma) * satScale;
+        b = luma + (b - luma) * satScale;
+    }
+    const curLuma = Math.max(0.2126 * r + 0.7152 * g + 0.0722 * b, 1e-4);
+    const targetLuma = Math.max(0.45, Math.min(0.84, curLuma));
+    const lumaScale = targetLuma / curLuma;
+    return [
+        Math.max(0.42, Math.min(0.86, r * lumaScale)),
+        Math.max(0.42, Math.min(0.86, g * lumaScale)),
+        Math.max(0.42, Math.min(0.86, b * lumaScale)),
+    ];
+}
+
+export function sampleNaturalScleraColor(img, uvs) {
+    try {
+        if (!img || !uvs || uvs.length < 468 * 2) return null;
+        const natW = img.naturalWidth || img.width || 512;
+        const natH = img.naturalHeight || img.height || 512;
+        const scale = Math.min(1.0, 1024 / Math.max(natW, natH, 1));
+        const w = Math.max(1, Math.round(natW * scale));
+        const h = Math.max(1, Math.round(natH * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, w, h);
+
+        const toPx = (idx) => [uvs[idx * 2] * (w - 1), (1.0 - uvs[idx * 2 + 1]) * (h - 1)];
+        const hasIris = uvs.length >= 478 * 2;
+        const samples = [];
+
+        for (let eIdx = 0; eIdx < EYE_SPECS.length; eIdx++) {
+            const spec = EYE_SPECS[eIdx];
+            const outerPx = toPx(spec.outerIdx);
+            const innerPx = toPx(spec.innerIdx);
+            const upPx = toPx(spec.upperMidIdx);
+            const loPx = toPx(spec.lowerMidIdx);
+            const eyeSpanPx = Math.hypot(innerPx[0] - outerPx[0], innerPx[1] - outerPx[1]);
+            if (eyeSpanPx < 4) continue;
+
+            const pupilPx = hasIris
+                ? toPx(spec.pupilIdx)
+                : [0.5 * (outerPx[0] + innerPx[0]), 0.5 * (outerPx[1] + innerPx[1])];
+            let rIrisPx = 0.22 * eyeSpanPx;
+            if (hasIris) {
+                let sumR = 0;
+                for (const ri of spec.irisRingIndices) {
+                    const rp = toPx(ri);
+                    sumR += Math.hypot(rp[0] - pupilPx[0], rp[1] - pupilPx[1]);
+                }
+                rIrisPx = sumR / spec.irisRingIndices.length;
+            }
+
+            const upX = upPx[0] - loPx[0];
+            const upY = upPx[1] - loPx[1];
+            const corners = [outerPx, innerPx];
+            for (let cIdx = 0; cIdx < corners.length; cIdx++) {
+                const corner = corners[cIdx];
+                const dx = corner[0] - pupilPx[0];
+                const dy = corner[1] - pupilPx[1];
+                const dist = Math.hypot(dx, dy);
+                if (dist <= rIrisPx * 1.05) continue;
+
+                const t = (0.5 * (rIrisPx + dist)) / dist;
+                // Slightly nudge above/below horizontal midline to avoid lashes while spanning both eyelids
+                const vShift = (eIdx + cIdx) % 2 === 0 ? -0.06 : 0.05;
+                const px = Math.max(0, Math.min(w - 1, Math.round(pupilPx[0] + dx * t + upX * vShift)));
+                const py = Math.max(0, Math.min(h - 1, Math.round(pupilPx[1] + dy * t + upY * vShift)));
+                const d = ctx.getImageData(px, py, 1, 1).data;
+                if (d[3] < 128) continue;
+
+                const r = d[0] / 255;
+                const g = d[1] / 255;
+                const b = d[2] / 255;
+                const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                if (luma < 0.22 || luma > 0.85) continue;
+                samples.push({ r, g, b, luma });
+            }
+        }
+
+        if (!samples.length) return null;
+        const rMed = medianChannel(samples.map((s) => s.r)) * 0.94;
+        const gMed = medianChannel(samples.map((s) => s.g)) * 0.94;
+        const bMed = medianChannel(samples.map((s) => s.b)) * 0.94;
+        return clampNaturalScleraRgb(rMed, gMed, bMed);
+    } catch {
+        return null;
+    }
+}
+
+function loadTextureFromDataUrl(dataUrl, uvs, filter = THREE.LinearFilter, sampleSclera = false) {
     return new Promise((resolve, reject) => {
         if (!dataUrl) {
-            resolve({ tex: null, skinColor: null });
+            resolve({ tex: null, skinColor: null, scleraColor: null });
             return;
         }
         const img = new Image();
         img.onload = () => {
             const skinColor = uvs ? sampleMedianSkinColor(img, uvs) : null;
+            const scleraColor = (sampleSclera && uvs) ? sampleNaturalScleraColor(img, uvs) : null;
             const tex = new THREE.Texture(img);
             tex.colorSpace = THREE.SRGBColorSpace;
             tex.flipY = true;
             tex.wrapS = THREE.ClampToEdgeWrapping;
             tex.wrapT = THREE.ClampToEdgeWrapping;
-            tex.minFilter = THREE.LinearFilter;
-            tex.magFilter = THREE.LinearFilter;
+            tex.minFilter = filter;
+            tex.magFilter = filter;
             tex.needsUpdate = true;
-            resolve({ tex, skinColor });
+            resolve({ tex, skinColor, scleraColor });
         };
         img.onerror = () => reject(new Error("Failed to load texture image."));
         img.src = dataUrl;
@@ -178,15 +282,28 @@ export class ReconstructedFaceMesh {
         this.group.add(this.depthHullMesh, this.eyeballRig.group, this.weightDebugPoints);
 
         this.frontTexture = null;
+        this.frontSkinColor = null;
+        this.frontScleraColor = null;
+        this.bakedTexture = null;
+        this.bakedSkinColor = null;
+        this.sourceMapTexture = null;
+        this.hairMaskTexture = null;
         this.hasTexture = false;
+        this.mvTexEnabled = true;
+        this.uvDebugMode = "off";
 
         this.basePositions = null;
         this.baseIndices = null;
         this.baseUvs = null;
+        this.canonicalUvs = null;
         this.restPositions = null;
         this.animScratch = null;
         this.mergedPositions = null;
         this.mergedUvs = null;
+        this.mergedUvsFront = null;
+        this.subdivUvsFront = null;
+        this.mergedUvsCanonical = null;
+        this.subdivUvsCanonical = null;
         this.mergedFaceMask = null;
         this.mergedIndices = null;
         this.mergedScratch = null;
@@ -222,7 +339,7 @@ export class ReconstructedFaceMesh {
         this.poseOcclude = true;
         this.poseOverlay = false;
 
-        // Start warming cached GLB fetches immediately in browser environments
+        // Start warming cached GLB & canonical UV fetches immediately in browser environments
         if (typeof window !== "undefined" && typeof fetch === "function") {
             getHeadShellRig().then((rig) => {
                 if (rig) this.shellRig = rig;
@@ -230,6 +347,13 @@ export class ReconstructedFaceMesh {
             getOpenPoseRigData().then((data) => {
                 if (data) this.attachOpenPoseData(data);
             });
+            getCanonicalFaceData()
+                .then((data) => {
+                    if (data?.uv_front && !this.canonicalUvs) {
+                        this.canonicalUvs = new Float32Array(data.uv_front);
+                    }
+                })
+                .catch(() => {});
         }
     }
 
@@ -268,7 +392,6 @@ export class ReconstructedFaceMesh {
         this.sculptRig = new SculptRig(this.basePositions, this.baseIndices);
         this.restPositions = this.sculptRig.evaluate(this.sculptState);
         this.morphRig = new FaceRetargetRig(this.restPositions, this.baseIndices, this.regionWeights);
-        this.eyeballRig.configureRest(this.restPositions, this.baseUvs);
 
         if (overrideShellRig !== undefined) {
             this.shellRig = overrideShellRig;
@@ -283,6 +406,17 @@ export class ReconstructedFaceMesh {
             if (opData) this.attachOpenPoseData(opData);
         }
 
+        if (!this.canonicalUvs && typeof window !== "undefined" && typeof fetch === "function") {
+            try {
+                const cfData = await getCanonicalFaceData();
+                if (cfData?.uv_front) {
+                    this.canonicalUvs = new Float32Array(cfData.uv_front);
+                }
+            } catch {
+                // Canonical UVs only needed when MV Tex baking is active
+            }
+        }
+
         if (this.shellRig) {
             const merged = this.shellRig.buildMergedRestMesh(
                 this.restPositions,
@@ -291,6 +425,7 @@ export class ReconstructedFaceMesh {
             );
             this.mergedPositions = merged.positions;
             this.mergedUvs = merged.uvs;
+            this.mergedUvsFront = merged.uvs;
             this.mergedFaceMask = merged.faceMask;
             this.mergedIndices = merged.indices;
             this.mergedScratch = new Float32Array(merged.totalVerts * 3);
@@ -310,6 +445,7 @@ export class ReconstructedFaceMesh {
             const nVerts = Math.floor(this.basePositions.length / 3);
             this.mergedPositions = new Float32Array(this.restPositions);
             this.mergedUvs = this.baseUvs;
+            this.mergedUvsFront = this.baseUvs;
             this.mergedFaceMask = new Float32Array(nVerts).fill(1.0);
             this.mergedIndices = this.baseIndices;
             this.mergedScratch = new Float32Array(this.basePositions.length);
@@ -326,7 +462,11 @@ export class ReconstructedFaceMesh {
                 this.mergedFaceMask
             );
         }
+        this.subdivUvsFront = this.subdivider.subdivUvs;
+        this.mergedUvsCanonical = null;
+        this.subdivUvsCanonical = null;
 
+        this.eyeballRig.configureRest(this.restPositions, this.baseUvs);
         this.lastMotionFrame = null;
         this.bindActiveTopology();
         this.uploadPositions(this.mergedPositions);
@@ -339,23 +479,94 @@ export class ReconstructedFaceMesh {
         this.syncPoseVisibility();
     }
 
+    buildMergedUvs(faceUvs) {
+        if (!faceUvs) return null;
+        if (!this.shellRig) return faceUvs;
+        const totalVerts = 478 + this.shellRig.nInterior;
+        const faceCount = Math.min(478, Math.floor(faceUvs.length / 2));
+        const out = new Float32Array(totalVerts * 2);
+        out.set(faceUvs.subarray(0, faceCount * 2));
+        for (let i = 0; i < this.shellRig.nInterior; i++) {
+            const mp = this.shellRig.nearestSocketMp[i];
+            if (mp >= 0 && mp * 2 + 1 < faceUvs.length) {
+                out[(478 + i) * 2] = faceUvs[mp * 2];
+                out[(478 + i) * 2 + 1] = faceUvs[mp * 2 + 1];
+            } else {
+                out[(478 + i) * 2] = 0.5;
+                out[(478 + i) * 2 + 1] = 0.5;
+            }
+        }
+        return out;
+    }
+
+    buildSubdivUvs(mergedUvs) {
+        if (!mergedUvs || !this.subdivider) return null;
+        const out = new Float32Array(this.subdivider.totalVerts * 2);
+        out.set(mergedUvs);
+        const edges = this.subdivider.edgePairs;
+        for (let e = 0; e < edges.length; e += 3) {
+            const a = edges[e];
+            const b = edges[e + 1];
+            const m = edges[e + 2];
+            out[m * 2] = 0.5 * (mergedUvs[a * 2] + mergedUvs[b * 2]);
+            out[m * 2 + 1] = 0.5 * (mergedUvs[a * 2 + 1] + mergedUvs[b * 2 + 1]);
+        }
+        return out;
+    }
+
+    isMultiViewTextureActive() {
+        return Boolean(this.mvTexEnabled && this.bakedTexture && this.canonicalUvs);
+    }
+
+    hasBakedTextures() {
+        return Boolean(this.bakedTexture);
+    }
+
+    getActiveFaceUvs() {
+        return this.isMultiViewTextureActive() ? this.canonicalUvs : this.baseUvs;
+    }
+
+    ensureCanonicalMergedUvs() {
+        if (!this.canonicalUvs) return;
+        if (!this.mergedUvsCanonical) {
+            this.mergedUvsCanonical = this.buildMergedUvs(this.canonicalUvs);
+        }
+        if (this.subdivider && !this.subdivUvsCanonical && this.mergedUvsCanonical) {
+            this.subdivUvsCanonical = this.buildSubdivUvs(this.mergedUvsCanonical);
+        }
+    }
+
+    getActiveDisplayUvs() {
+        if (this.isMultiViewTextureActive()) {
+            this.ensureCanonicalMergedUvs();
+            const arr = this.smoothEnabled ? this.subdivUvsCanonical : this.mergedUvsCanonical;
+            if (arr) return arr;
+        }
+        return this.smoothEnabled ? this.subdivUvsFront : this.mergedUvsFront;
+    }
+
     bindActiveTopology() {
         if (!this.mergedPositions || !this.subdivider) return;
+        const activeUvs = this.getActiveDisplayUvs();
         if (this.smoothEnabled) {
             const posCopy = new Float32Array(this.subdivider.subdivPositions.length);
-            const uvCopy = new Float32Array(this.subdivider.subdivUvs);
+            const uvCopy = new Float32Array(activeUvs || this.subdivider.subdivUvs);
             const maskCopy = new Float32Array(this.subdivider.subdivFaceMask);
+            const scleraCopy = new Float32Array(this.subdivider.totalVerts).fill(-1.0);
             this.geometry.setAttribute("position", new THREE.BufferAttribute(posCopy, 3));
             this.geometry.setAttribute("uv", new THREE.BufferAttribute(uvCopy, 2));
             this.geometry.setAttribute("aFaceMask", new THREE.BufferAttribute(maskCopy, 1));
+            this.geometry.setAttribute("aScleraBlend", new THREE.BufferAttribute(scleraCopy, 1));
             this.geometry.setIndex(this.subdivider.subdivIndices);
         } else {
             const posCopy = new Float32Array(this.mergedPositions.length);
-            const uvCopy = new Float32Array(this.mergedUvs);
+            const uvCopy = new Float32Array(activeUvs || this.mergedUvs);
             const maskCopy = new Float32Array(this.mergedFaceMask);
+            const scleraCopy = new Float32Array(this.mergedFaceMask.length).fill(-1.0);
             this.geometry.setAttribute("position", new THREE.BufferAttribute(posCopy, 3));
             this.geometry.setAttribute("uv", new THREE.BufferAttribute(uvCopy, 2));
             this.geometry.setAttribute("aFaceMask", new THREE.BufferAttribute(maskCopy, 1));
+            this.geometry.setAttribute("aScleraBlend", new THREE.BufferAttribute(scleraCopy, 1));
             this.geometry.setIndex(this.mergedIndices);
         }
         this.applyDrawRange();
@@ -492,10 +703,18 @@ export class ReconstructedFaceMesh {
     }
 
     setSculptState(sculptState) {
-        this.sculptState = { ...sculptState };
+        const next = sculptState ? { ...sculptState } : null;
+        if (this.hasMesh && this.sculptRig && this.sculptState && next) {
+            const keysA = Object.keys(this.sculptState);
+            const keysB = Object.keys(next);
+            if (keysA.length === keysB.length && keysB.every((k) => Number(this.sculptState[k]) === Number(next[k]))) {
+                return;
+            }
+        }
+        this.sculptState = next;
         if (!this.hasMesh || !this.sculptRig) return;
         this.restPositions = this.sculptRig.evaluate(this.sculptState);
-        this.eyeballRig.configureRest(this.restPositions, this.baseUvs);
+        this.eyeballRig.configureRest(this.restPositions, this.getActiveFaceUvs());
         if (this.morphRig) {
             this.morphRig.updateRestPositions(this.restPositions);
         } else {
@@ -508,6 +727,13 @@ export class ReconstructedFaceMesh {
         }
     }
 
+    setIrisMaskScale(scale) {
+        const val = Number(scale);
+        if (Number.isFinite(val)) {
+            this.material.uniforms.uIrisMaskScale.value = val;
+        }
+    }
+
     setRegionWeights(weights) {
         this.regionWeights = { ...weights };
         this.morphRig?.setRegionWeights(this.regionWeights);
@@ -516,26 +742,128 @@ export class ReconstructedFaceMesh {
         }
     }
 
+    syncActiveTextureAndUvs() {
+        const useBaked = this.isMultiViewTextureActive();
+        const activeFaceUvs = this.getActiveFaceUvs();
+        if (this.restPositions && activeFaceUvs) {
+            this.eyeballRig.configureRest(this.restPositions, activeFaceUvs);
+        }
+
+        const uvAttr = this.geometry.getAttribute("uv");
+        const displayUvs = this.getActiveDisplayUvs();
+        if (uvAttr && displayUvs && uvAttr.array.length === displayUvs.length) {
+            uvAttr.array.set(displayUvs);
+            uvAttr.needsUpdate = true;
+        }
+
+        const u = this.material.uniforms;
+        if (this.frontTexture && this.frontScleraColor) {
+            const sc = this.frontScleraColor;
+            u.uScleraColor.value.setRGB(sc[0], sc[1], sc[2], THREE.SRGBColorSpace);
+        } else {
+            u.uScleraColor.value.setHex(DEFAULT_SCLERA_HEX);
+        }
+
+        if (!useBaked) {
+            u.uFrontTex.value = this.frontTexture || this.fallbackTex;
+            u.uHasTexture.value = this.hasTexture ? 1.0 : 0.0;
+            const c = this.frontTexture && this.frontSkinColor
+                ? this.frontSkinColor
+                : [216 / 255, 180 / 255, 160 / 255];
+            u.uSkinColor.value.setRGB(c[0], c[1], c[2], THREE.SRGBColorSpace);
+            return;
+        }
+
+        let activeTex = this.bakedTexture;
+        let skin = this.bakedSkinColor || this.frontSkinColor || [216 / 255, 180 / 255, 160 / 255];
+        let hasActivePortraitTex = this.hasTexture || Boolean(this.bakedTexture);
+        if (this.uvDebugMode === "source" && this.sourceMapTexture) {
+            activeTex = this.sourceMapTexture;
+            skin = [55 / 255, 65 / 255, 81 / 255];
+            hasActivePortraitTex = false;
+        } else if (this.uvDebugMode === "hair" && this.hairMaskTexture) {
+            activeTex = this.hairMaskTexture;
+            skin = [55 / 255, 65 / 255, 81 / 255];
+            hasActivePortraitTex = false;
+        }
+        u.uFrontTex.value = activeTex;
+        u.uHasTexture.value = hasActivePortraitTex ? 1.0 : 0.0;
+        u.uSkinColor.value.setRGB(skin[0], skin[1], skin[2], THREE.SRGBColorSpace);
+    }
+
     async updateFrontTexture(frontImageUrl) {
-        const { tex, skinColor } = await loadTextureFromDataUrl(frontImageUrl, this.baseUvs);
+        const { tex, skinColor, scleraColor } = await loadTextureFromDataUrl(
+            frontImageUrl,
+            this.baseUvs,
+            THREE.LinearFilter,
+            true
+        );
         this.disposeTextures();
         this.frontTexture = tex;
+        this.frontSkinColor = skinColor;
+        this.frontScleraColor = scleraColor;
         this.hasTexture = Boolean(tex);
-        this.material.uniforms.uFrontTex.value = tex || this.fallbackTex;
-        if (!tex) {
-            this.material.uniforms.uSkinColor.value.setRGB(
-                216 / 255,
-                180 / 255,
-                160 / 255,
-                THREE.SRGBColorSpace
-            );
-        } else if (skinColor) {
-            this.material.uniforms.uSkinColor.value.setRGB(
-                skinColor[0],
-                skinColor[1],
-                skinColor[2],
-                THREE.SRGBColorSpace
-            );
+        this.syncActiveTextureAndUvs();
+    }
+
+    async setBakedTextures({ bakedAlbedoUrl, sourceMapUrl, hairMaskUrl }, overrideCanonicalUvs = null) {
+        if (overrideCanonicalUvs) {
+            this.canonicalUvs = overrideCanonicalUvs instanceof Float32Array
+                ? overrideCanonicalUvs
+                : new Float32Array(overrideCanonicalUvs);
+            this.mergedUvsCanonical = null;
+            this.subdivUvsCanonical = null;
+        } else if (!this.canonicalUvs && typeof window !== "undefined" && typeof fetch === "function") {
+            const cfData = await getCanonicalFaceData();
+            if (cfData?.uv_front) {
+                this.canonicalUvs = new Float32Array(cfData.uv_front);
+            }
+        }
+
+        const [bakedRes, sourceRes, hairRes] = await Promise.all([
+            loadTextureFromDataUrl(bakedAlbedoUrl, this.canonicalUvs, THREE.LinearFilter),
+            loadTextureFromDataUrl(sourceMapUrl, null, THREE.NearestFilter),
+            loadTextureFromDataUrl(hairMaskUrl, null, THREE.NearestFilter),
+        ]);
+
+        this.disposeBakedTextures();
+        this.bakedTexture = bakedRes.tex;
+        this.bakedSkinColor = bakedRes.skinColor;
+        this.sourceMapTexture = sourceRes.tex;
+        this.hairMaskTexture = hairRes.tex;
+        this.mergedUvsCanonical = null;
+        this.subdivUvsCanonical = null;
+        if (this.hasMesh) {
+            this.syncActiveTextureAndUvs();
+        }
+    }
+
+    clearBakedTextures() {
+        this.disposeBakedTextures();
+        if (this.hasMesh) {
+            this.syncActiveTextureAndUvs();
+        }
+    }
+
+    setMvTexEnabled(enabled) {
+        const next = Boolean(enabled);
+        if (next === this.mvTexEnabled) return;
+        this.mvTexEnabled = next;
+        if (!next) {
+            this.uvDebugMode = "off";
+        }
+        if (this.hasMesh) {
+            this.syncActiveTextureAndUvs();
+        }
+    }
+
+    setUvDebugMode(mode) {
+        const valid = ["off", "source", "hair"];
+        const next = valid.includes(mode) ? mode : "off";
+        if (next === this.uvDebugMode) return;
+        this.uvDebugMode = next;
+        if (this.hasMesh) {
+            this.syncActiveTextureAndUvs();
         }
     }
 
@@ -761,13 +1089,34 @@ export class ReconstructedFaceMesh {
         this.applyGuideVisibility();
     }
 
+    disposeBakedTextures() {
+        if (this.bakedTexture) {
+            this.bakedTexture.dispose();
+            this.bakedTexture = null;
+        }
+        if (this.sourceMapTexture) {
+            this.sourceMapTexture.dispose();
+            this.sourceMapTexture = null;
+        }
+        if (this.hairMaskTexture) {
+            this.hairMaskTexture.dispose();
+            this.hairMaskTexture = null;
+        }
+        this.bakedSkinColor = null;
+    }
+
     disposeTextures() {
+        this.disposeBakedTextures();
         if (this.frontTexture) {
             this.frontTexture.dispose();
             this.frontTexture = null;
         }
+        this.frontSkinColor = null;
+        this.frontScleraColor = null;
         this.hasTexture = false;
         this.material.uniforms.uFrontTex.value = this.fallbackTex;
+        this.material.uniforms.uHasTexture.value = 0.0;
+        this.material.uniforms.uScleraColor.value.setHex(DEFAULT_SCLERA_HEX);
         this.material.uniforms.uSkinColor.value.setRGB(
             216 / 255,
             180 / 255,
@@ -781,6 +1130,7 @@ export class ReconstructedFaceMesh {
         this.geometry.deleteAttribute("position");
         this.geometry.deleteAttribute("uv");
         this.geometry.deleteAttribute("aFaceMask");
+        this.geometry.deleteAttribute("aScleraBlend");
         this.geometry.deleteAttribute("normal");
         this.geometry.setIndex([]);
         this.geometry.setDrawRange(0, Infinity);
@@ -794,6 +1144,10 @@ export class ReconstructedFaceMesh {
         this.animScratch = null;
         this.mergedPositions = null;
         this.mergedUvs = null;
+        this.mergedUvsFront = null;
+        this.subdivUvsFront = null;
+        this.mergedUvsCanonical = null;
+        this.subdivUvsCanonical = null;
         this.mergedFaceMask = null;
         this.mergedIndices = null;
         this.mergedScratch = null;
@@ -819,6 +1173,8 @@ export class ReconstructedFaceMesh {
             this.regionWeights = null;
             this.weightDebugVisible = false;
             this.weightDebugView = "combined";
+            this.mvTexEnabled = true;
+            this.uvDebugMode = "off";
         }
         this.group.rotation.set(0, 0, 0);
         this.group.quaternion.identity();

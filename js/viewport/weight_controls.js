@@ -11,6 +11,11 @@ export const DEFAULT_WEIGHT_STATE = {
     dispSmooth: 0.45,
     maxDisp: 0.18,
     symmetry: 0.0,
+    enableSilhouetteFit: true,
+    silhouetteStrength: 0.75,
+    enableColorMatch: true,
+    enableSeamBlend: true,
+    irisMaskScale: 1.08,
 };
 
 /**
@@ -65,8 +70,13 @@ export function createWeightPanel(onChange) {
         });
 
         setters.push(() => {
-            input.value = String(state[key]);
-            valEl.textContent = state[key].toFixed(2);
+            const raw = state[key];
+            const num = (raw !== null && raw !== undefined && raw !== "" && Number.isFinite(Number(raw)))
+                ? Number(raw)
+                : DEFAULT_WEIGHT_STATE[key];
+            state[key] = num;
+            input.value = String(num);
+            valEl.textContent = num.toFixed(2);
         });
 
         row.append(lbl, input, valEl);
@@ -95,6 +105,62 @@ export function createWeightPanel(onChange) {
     addSlider("Disp. Smooth", "dispSmooth", 0, 1, 0.05);
     addSlider("Max Disp.", "maxDisp", 0.05, 0.50, 0.01);
     addSlider("Symmetry", "symmetry", 0, 1, 0.05);
+
+    const addToggle = (label, key, withDivider = false) => {
+        const row = document.createElement("div");
+        Object.assign(row.style, {
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            ...(withDivider
+                ? { marginTop: "2px", paddingTop: "4px", borderTop: "1px solid rgba(71, 85, 105, 0.45)" }
+                : {}),
+        });
+        const lbl = document.createElement("span");
+        lbl.textContent = label;
+        Object.assign(lbl.style, {
+            fontSize: "10px",
+            color: "#cbd5e1",
+            fontWeight: "500",
+        });
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.setAttribute("data-weight-toggle", key);
+        Object.assign(btn.style, {
+            fontSize: "9px",
+            fontWeight: "600",
+            padding: "2px 8px",
+            borderRadius: "4px",
+            cursor: "pointer",
+            lineHeight: "1.2",
+        });
+        const sync = () => {
+            const enabled = state[key] !== false;
+            state[key] = enabled;
+            btn.textContent = enabled ? "ON" : "OFF";
+            btn.style.background = enabled ? "rgba(16, 185, 129, 0.22)" : "rgba(51, 65, 85, 0.5)";
+            btn.style.border = enabled ? "1px solid rgba(52, 211, 153, 0.55)" : "1px solid rgba(71, 85, 105, 0.65)";
+            btn.style.color = enabled ? "#6ee7b7" : "#94a3b8";
+        };
+        stopViewportEvents(btn);
+        btn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            state[key] = state[key] === false;
+            sync();
+            onChange({ ...state });
+        });
+        sync();
+        setters.push(sync);
+        row.appendChild(lbl);
+        row.appendChild(btn);
+        panel.appendChild(row);
+    };
+
+    addToggle("Silh. Fit", "enableSilhouetteFit", true);
+    addSlider("Silh. Strength", "silhouetteStrength", 0, 1, 0.05);
+    addToggle("Color Match", "enableColorMatch", true);
+    addToggle("Seam Blend", "enableSeamBlend", false);
+    addSlider("Iris Mask", "irisMaskScale", 0.75, 1.60, 0.02);
 
     const note = document.createElement("div");
     note.textContent = "Intermediate vertices blend smoothly across mesh edges.";

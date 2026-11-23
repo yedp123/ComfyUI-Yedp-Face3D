@@ -70,11 +70,38 @@ function createDomeTopology() {
         }
     }
 
+    const vertCount = Math.floor(dirs.length / 3);
+
     return {
         unitDirs: new Float32Array(dirs),
-        vertCount: Math.floor(dirs.length / 3),
+        vertCount,
         indices,
     };
+}
+
+function measureRestIrisAndGaze(positions, spec, socket) {
+    const hasIris = positions.length >= 478 * 3;
+    const irisCenterIdx = hasIris ? spec.pupilIdx : spec.upperMidIdx;
+    const irisCx = hasIris ? positions[irisCenterIdx * 3] : socket.cx;
+    const irisCy = hasIris ? positions[irisCenterIdx * 3 + 1] : socket.cy;
+
+    const restGx = Math.max(-0.35, Math.min(0.35, (irisCx - socket.cx) / Math.max(socket.rx, 1e-4)));
+    const restGy = Math.max(-0.22, Math.min(0.22, (irisCy - socket.cy) / Math.max(socket.ry, 1e-4)));
+    const baseYaw = Math.asin(restGx);
+    const basePitch = -Math.asin(restGy);
+
+    let irisRadPx = socket.eyeW * 0.22;
+    if (hasIris) {
+        let sumR = 0;
+        for (const ri of spec.irisRingIndices) {
+            sumR += Math.hypot(
+                positions[ri * 3] - irisCx,
+                positions[ri * 3 + 1] - irisCy
+            );
+        }
+        irisRadPx = Math.max(sumR / spec.irisRingIndices.length, socket.eyeW * 0.16);
+    }
+    return { hasIris, irisCenterIdx, irisCx, irisCy, baseYaw, basePitch, irisRadPx };
 }
 
 /**
@@ -169,11 +196,13 @@ export class EyeballRig {
             const norm = new Float32Array(this.topo.vertCount * 3);
             const uv = new Float32Array(this.topo.vertCount * 2);
             const mask = new Float32Array(this.topo.vertCount).fill(1.0);
+            const scleraBlend = new Float32Array(this.topo.vertCount);
 
             geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
             geo.setAttribute("normal", new THREE.BufferAttribute(norm, 3));
             geo.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
             geo.setAttribute("aFaceMask", new THREE.BufferAttribute(mask, 1));
+            geo.setAttribute("aScleraBlend", new THREE.BufferAttribute(scleraBlend, 1));
             geo.setIndex(this.topo.indices);
 
             const mesh = new THREE.Mesh(geo, material);
@@ -187,6 +216,7 @@ export class EyeballRig {
                 pos,
                 norm,
                 uv,
+                scleraBlend,
                 restSocket: null,
                 baseYaw: 0,
                 basePitch: 0,
@@ -198,13 +228,12 @@ export class EyeballRig {
     }
 
     /**
-     * Fit eyeball sockets and portrait-matched iris/sclera UVs from post-sculpt rest geometry.
+     * Fit eyeball sockets, portrait-matched iris/sclera UVs, and normalized radial iris distances.
      */
     configureRest(restPositions, restUvs) {
         if (!restPositions || !restUvs || restPositions.length < 468 * 3) return;
         const unit = this.topo.unitDirs;
         const nVerts = this.topo.vertCount;
-        const hasIris = restPositions.length >= 478 * 3;
 
         for (const eye of this.eyes) {
             const spec = eye.spec;
@@ -232,34 +261,22 @@ export class EyeballRig {
             const uLo = restUvs[spec.lowerMidIdx * 2];
             const vLo = restUvs[spec.lowerMidIdx * 2 + 1];
 
-            const irisCenterIdx = hasIris ? spec.pupilIdx : spec.upperMidIdx;
-            const irisCx = hasIris ? restPositions[irisCenterIdx * 3] : socket.cx;
-            const irisCy = hasIris ? restPositions[irisCenterIdx * 3 + 1] : socket.cy;
+            const { hasIris, irisCenterIdx, baseYaw, basePitch, irisRadPx } = measureRestIrisAndGaze(
+                restPositions,
+                spec,
+                socket
+            );
             const irisU0 = hasIris ? restUvs[irisCenterIdx * 2] : 0.5 * (uOut + uIn);
             const irisV0 = hasIris ? restUvs[irisCenterIdx * 2 + 1] : 0.5 * (vUp + vLo);
 
-            // Rest pupil angular offset so rest gaze points right at front portrait iris center
-            const restGx = Math.max(-0.35, Math.min(0.35, (irisCx - socket.cx) / Math.max(socket.rx, 1e-4)));
-            const restGy = Math.max(-0.22, Math.min(0.22, (irisCy - socket.cy) / Math.max(socket.ry, 1e-4)));
-            eye.baseYaw = Math.asin(restGx);
-            eye.basePitch = -Math.asin(restGy);
-
-            let irisRadPx = socket.eyeW * 0.22;
-            if (hasIris) {
-                let sumR = 0;
-                for (const ri of spec.irisRingIndices) {
-                    sumR += Math.hypot(
-                        restPositions[ri * 3] - irisCx,
-                        restPositions[ri * 3 + 1] - irisCy
-                    );
-                }
-                irisRadPx = Math.max(sumR / spec.irisRingIndices.length, socket.eyeW * 0.16);
-            }
+            eye.baseYaw = baseYaw;
+            eye.basePitch = basePitch;
 
             const hueX = uIn - uOut;
             const hueY = vIn - vOut;
             const vueX = uUp - uLo;
             const vueY = vUp - vLo;
+            const invIrisRad = 1.0 / Math.max(irisRadPx, 1e-4);
 
             // Clamp sclera sample offsets cleanly inside open eye strip so rotated dome never samples eyelashes
             const toBasis = (dx, dy) => {
@@ -277,6 +294,7 @@ export class EyeballRig {
                 const localX = ux * socket.rx;
                 const localY = uy * socket.ry;
                 const radial = Math.hypot(localX, localY);
+                eye.scleraBlend[i] = radial * invIrisRad;
 
                 // Inside iris radius use direct local coords; smoothly clamp outer sclera vertically into open eye strip
                 const scleraBlend = smoothstep(irisRadPx * 0.85, irisRadPx * 1.45, radial);
@@ -298,6 +316,8 @@ export class EyeballRig {
                 eye.uv[i * 2 + 1] = Math.max(0, Math.min(1, v));
             }
             eye.geo.getAttribute("uv").needsUpdate = true;
+            eye.geo.getAttribute("aScleraBlend").needsUpdate = true;
+
             eye.lastGazeX = 999;
             eye.lastGazeY = 999;
             eye.lastPosChecksum = NaN;
@@ -399,6 +419,8 @@ export class EyeballRig {
         this.group.visible = false;
         for (const eye of this.eyes) {
             eye.restSocket = null;
+            eye.scleraBlend.fill(0);
+            eye.geo.getAttribute("aScleraBlend").needsUpdate = true;
             eye.lastPosChecksum = NaN;
         }
     }
