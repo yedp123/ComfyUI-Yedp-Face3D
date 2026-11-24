@@ -1,12 +1,12 @@
 import { stopViewportEvents } from "./ui_icons.js";
 
 export const DEFAULT_WEIGHT_STATE = {
-    eyes: 1.15,
+    eyes: 1.0,
     brows: 1.0,
     mouth: 1.0,
     mouthWidth: 0.55,
     jaw: 0.85,
-    cheeks: 0.45,
+    cheeks: 0.42,
     baseAnchor: 0.25,
     dispSmooth: 0.45,
     maxDisp: 0.18,

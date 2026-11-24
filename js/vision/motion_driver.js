@@ -23,6 +23,32 @@ function clamp01(v) {
     return Math.max(0, Math.min(1, v));
 }
 
+function smoothstep(edge0, edge1, x) {
+    const t = clamp01((x - edge0) / Math.max(edge1 - edge0, 1e-6));
+    return t * t * (3 - 2 * t);
+}
+
+// Region tags: 2 = Mouth & Jaw (snappy speech), 1 = Brows & Pupils (fast saccades), 0 = Cheeks/Rest (anti-jitter)
+const REGION_TAGS = (() => {
+    const tags = new Uint8Array(478);
+    const group2 = [
+        0, 11, 12, 13, 14, 15, 16, 17, 37, 38, 39, 40, 41, 42, 61, 62,
+        72, 73, 74, 76, 77, 78, 80, 81, 82, 84, 85, 86, 87, 88, 89, 90, 91, 95, 96,
+        146, 148, 149, 150, 152, 175, 176, 178, 179, 180, 181, 183, 184, 185, 191,
+        199, 200, 201, 267, 268, 269, 270, 271, 272, 291, 292, 302, 303, 304,
+        306, 307, 308, 310, 311, 312, 314, 315, 316, 317, 318, 319, 320, 321,
+        324, 325, 375, 377, 378, 379, 400, 402, 403, 404, 405, 407, 408, 409, 415,
+    ];
+    const group1 = [
+        46, 52, 53, 55, 63, 65, 66, 70, 105, 107,
+        276, 282, 283, 285, 293, 295, 296, 300, 334, 336,
+        468, 469, 470, 471, 472, 473, 474, 475, 476, 477,
+    ];
+    for (const id of group1) tags[id] = 1;
+    for (const id of group2) tags[id] = 2;
+    return tags;
+})();
+
 function swapLeftRightName(name) {
     if (name.endsWith("Left")) return `${name.slice(0, -4)}Right`;
     if (name.endsWith("Right")) return `${name.slice(0, -5)}Left`;
@@ -189,13 +215,34 @@ export class MotionDriver {
         const blinkR = mapBlink(rawBs.eyeBlinkRight || 0, mirrorYaw ? earL : earR, mirrorYaw ? "openEarLeft" : "openEarRight");
         const blinkL = mapBlink(rawBs.eyeBlinkLeft || 0, mirrorYaw ? earR : earL, mirrorYaw ? "openEarRight" : "openEarLeft");
 
-        // 4. Smooth pose, vertex deltas, and fast blinks
+        // 4. Velocity-adaptive regional EMA for pose, vertex deltas, and fast blinks
         if (smoothAlpha < 1.0 && this.hasPrev && this.smoothedDeltas?.length === rawDeltas.length) {
-            this.smoothedQuat.slerp(poseQuat, smoothAlpha);
-            const deltaAlpha = Math.max(smoothAlpha, 0.55);
-            const invD = 1.0 - deltaAlpha;
-            for (let i = 0; i < rawDeltas.length; i++) {
-                this.smoothedDeltas[i] = this.smoothedDeltas[i] * invD + rawDeltas[i] * deltaAlpha;
+            const angStep = 2.0 * Math.acos(Math.min(1.0, Math.abs(this.smoothedQuat.dot(poseQuat))));
+            const rotT = smoothstep(0.006, 0.045, angStep);
+            const rotAlpha = 0.35 + (0.68 - 0.35) * rotT;
+            this.smoothedQuat.slerp(poseQuat, rotAlpha);
+
+            const highAlphaFloor = smoothAlpha > 0.55 ? Math.min(smoothAlpha, 0.90) : 0.0;
+            for (let v = 0; v < n; v++) {
+                const o = v * 3;
+                const step = Math.hypot(
+                    rawDeltas[o] - this.smoothedDeltas[o],
+                    rawDeltas[o + 1] - this.smoothedDeltas[o + 1],
+                    rawDeltas[o + 2] - this.smoothedDeltas[o + 2]
+                );
+                const t = smoothstep(0.004, 0.022, step);
+                const group = v < REGION_TAGS.length ? REGION_TAGS[v] : 0;
+                let alpha = group === 2
+                    ? 0.48 + (0.88 - 0.48) * t
+                    : group === 1
+                        ? 0.45 + (0.82 - 0.45) * t
+                        : 0.30 + (0.60 - 0.30) * t;
+                if (highAlphaFloor > alpha) alpha = highAlphaFloor;
+
+                const invA = 1.0 - alpha;
+                this.smoothedDeltas[o] = this.smoothedDeltas[o] * invA + rawDeltas[o] * alpha;
+                this.smoothedDeltas[o + 1] = this.smoothedDeltas[o + 1] * invA + rawDeltas[o + 1] * alpha;
+                this.smoothedDeltas[o + 2] = this.smoothedDeltas[o + 2] * invA + rawDeltas[o + 2] * alpha;
             }
             const blinkAlpha = Math.max(smoothAlpha, 0.88);
             this.smoothedBlinkL = this.smoothedBlinkL * (1.0 - blinkAlpha) + blinkL * blinkAlpha;

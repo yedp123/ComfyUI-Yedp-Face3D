@@ -334,8 +334,15 @@ export class EyeballRig {
         const unit = this.topo.unitDirs;
         const nVerts = this.topo.vertCount;
         const hasIris = positions.length >= 478 * 3;
+        const nEyes = this.eyes.length;
 
-        for (const eye of this.eyes) {
+        const eyeFrames = new Array(nEyes);
+        let dgxSum = 0;
+        let dgySum = 0;
+        let activeIrisCount = 0;
+
+        for (let e = 0; e < nEyes; e++) {
+            const eye = this.eyes[e];
             const socket = eye.restSocket;
             if (!socket) continue;
             const spec = eye.spec;
@@ -350,13 +357,41 @@ export class EyeballRig {
             const cy = socket.cy + shiftY;
             const cz = socket.cz + shiftZ;
 
-            let gx = Math.sin(eye.baseYaw);
-            let gy = -Math.sin(eye.basePitch);
+            const restGx = Math.sin(eye.baseYaw);
+            const restGy = -Math.sin(eye.basePitch);
+            let dgx = 0;
+            let dgy = 0;
             if (hasIris) {
                 const px = positions[spec.pupilIdx * 3];
                 const py = positions[spec.pupilIdx * 3 + 1];
-                gx = Math.max(-0.35, Math.min(0.35, (px - cx) / Math.max(socket.rx, 1e-4)));
-                gy = Math.max(-0.22, Math.min(0.22, (py - cy) / Math.max(socket.ry, 1e-4)));
+                dgx = ((px - cx) / Math.max(socket.rx, 1e-4)) - restGx;
+                dgy = ((py - cy) / Math.max(socket.ry, 1e-4)) - restGy;
+                dgxSum += dgx;
+                dgySum += dgy;
+                activeIrisCount++;
+            }
+
+            eyeFrames[e] = { cx, cy, cz, restGx, restGy, dgx, dgy };
+        }
+
+        const useConjugate = hasIris && activeIrisCount === 2;
+        const avgDgx = useConjugate ? 0.5 * dgxSum : 0;
+        const avgDgy = useConjugate ? 0.5 * dgySum : 0;
+
+        for (let e = 0; e < nEyes; e++) {
+            const frame = eyeFrames[e];
+            if (!frame) continue;
+            const eye = this.eyes[e];
+            const socket = eye.restSocket;
+            const { cx, cy, cz, restGx, restGy } = frame;
+
+            let gx = restGx;
+            let gy = restGy;
+            if (hasIris) {
+                const dgx = useConjugate ? avgDgx : frame.dgx;
+                const dgy = useConjugate ? avgDgy : frame.dgy;
+                gx = Math.max(-0.30, Math.min(0.30, restGx + dgx));
+                gy = Math.max(-0.20, Math.min(0.20, restGy + dgy));
             }
 
             const checksum = cx * 7.1 + cy * 11.3 + cz * 13.7 + socket.rx * 17.9 + socket.rz * 19.1;

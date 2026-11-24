@@ -506,8 +506,8 @@ export class FaceRetargetRig {
                 const dz = Math.max(-0.04, Math.min(0.04, deltas[sOff + 2] * scaleZ * w * cAtten));
 
                 if (PUPIL_SET.has(i)) {
-                    const maxGazeX = this.charEyeSpan * 0.09;
-                    const maxGazeY = this.charEyeSpan * 0.055;
+                    const maxGazeX = this.charEyeSpan * 0.08;
+                    const maxGazeY = this.charEyeSpan * 0.05;
                     this._tempDx[i] = Math.max(-maxGazeX, Math.min(maxGazeX, dx));
                     this._tempDy[i] = Math.max(-maxGazeY, Math.min(maxGazeY, dy));
                     this._tempDz[i] = Math.max(-0.015, Math.min(0.015, dz));
