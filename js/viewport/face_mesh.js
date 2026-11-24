@@ -15,6 +15,9 @@ import { EYE_SPECS, EyeballRig } from "./eyeball_rig.js";
 
 const _worldCenter = new THREE.Vector3();
 const _dbgColor = new THREE.Color();
+const _yAxis = new THREE.Vector3(0, 1, 0);
+const _yawQuat = new THREE.Quaternion();
+const _actorQuat = new THREE.Quaternion();
 const SKIN_SAMPLE_LANDMARKS = [50, 280, 117, 346, 151, 9, 195];
 const DEFAULT_SCLERA_HEX = 0xd6d1cb;
 
@@ -900,9 +903,14 @@ export class ReconstructedFaceMesh {
         this.uploadFaceFrame(this.restPositions);
     }
 
-    setTurntableYaw(yawRad) {
-        this.group.quaternion.identity();
-        this.group.rotation.set(0, yawRad, 0);
+    setTurntableYaw(yawRad, baseQuat = null) {
+        _yawQuat.setFromAxisAngle(_yAxis, yawRad);
+        if (baseQuat && baseQuat.length === 4) {
+            _actorQuat.set(baseQuat[0], baseQuat[1], baseQuat[2], baseQuat[3]);
+            this.group.quaternion.copy(_yawQuat).multiply(_actorQuat);
+        } else {
+            this.group.quaternion.copy(_yawQuat);
+        }
     }
 
     updateDepthBounds(camera, dynamicMode = false) {

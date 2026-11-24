@@ -11,12 +11,16 @@ export function createRightSidebar(sections) {
         minWidth: "200px",
         flexShrink: "0",
         height: "100%",
+        minHeight: "0",
         backgroundColor: "rgba(13, 17, 24, 0.96)",
         borderLeft: "1px solid rgba(255, 255, 255, 0.12)",
         display: "flex",
         flexDirection: "column",
         overflowY: "auto",
         overflowX: "hidden",
+        overscrollBehavior: "contain",
+        scrollbarWidth: "thin",
+        scrollbarColor: "rgba(148, 163, 184, 0.35) transparent",
         pointerEvents: "auto",
         boxSizing: "border-box",
     });
@@ -32,6 +36,7 @@ export function createRightSidebar(sections) {
         Object.assign(group.style, {
             display: "flex",
             flexDirection: "column",
+            flexShrink: "0",
             borderBottom: "1px solid rgba(255, 255, 255, 0.08)",
         });
 

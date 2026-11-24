@@ -31,6 +31,10 @@ const ICON_PATHS = {
         { tag: "circle", cx: "12", cy: "12", r: "8.5", stroke: true },
         { tag: "path", d: "M12 3.5a8.5 8.5 0 0 1 8.5 8.5M3.5 12h17M12 3.5c-2.6 2.5-2.6 14.5 0 17M12 3.5c2.6 2.5 2.6 14.5 0 17", stroke: true, width: "1.5" },
     ],
+    export: [
+        { tag: "path", d: "M12 3l7.5 4.3v8.4L12 20l-7.5-4.3V7.3L12 3z", stroke: true },
+        { tag: "path", d: "M12 12l7.5-4.7M12 12v8M12 12L4.5 7.3", stroke: true, width: "1.4" },
+    ],
     chevron: [
         { tag: "path", d: "M6 9l6 6 6-6z", fill: "currentColor" },
     ],

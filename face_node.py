@@ -1,51 +1,16 @@
 import asyncio
-import base64
-import io as py_io
 import json
 import math
 import uuid
 import numpy as np
-from PIL import Image
 import torch
 import torch.nn.functional as F
 from comfy_api.latest import io
 from server import PromptServer
 
-from .server_routes import cache_driving_batch, create_render_job, pop_render_job
+from .server_routes import create_render_job, pop_render_job
 
 _RENDER_TIMEOUT_SECONDS = 120.0
-
-
-def _frame_to_data_url(frame_tensor: torch.Tensor, max_side: int = 1024, quality: int = 92) -> str:
-    """Convert a single [H, W, C] ComfyUI image tensor to a JPEG data URL on CPU."""
-    frame = frame_tensor.detach().to("cpu", dtype=torch.float32).clamp(0.0, 1.0)
-    arr = (frame.numpy() * 255.0).astype(np.uint8)
-    pil_img = Image.fromarray(arr, mode="RGB")
-
-    w, h = pil_img.size
-    longest = max(w, h)
-    if longest > max_side:
-        scale = max_side / float(longest)
-        pil_img = pil_img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
-
-    buf = py_io.BytesIO()
-    pil_img.save(buf, format="JPEG", quality=quality)
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/jpeg;base64,{b64}"
-
-
-def _tensor_to_data_url(image_tensor: torch.Tensor | None, max_side: int = 1024) -> str | None:
-    """Convert first frame of a [B, H, W, C] ComfyUI IMAGE tensor to a JPEG data URL on CPU."""
-    if image_tensor is None or image_tensor.numel() == 0:
-        return None
-    return _frame_to_data_url(image_tensor[0], max_side=max_side, quality=92)
-
-
-def _batch_to_data_urls(video_tensor: torch.Tensor | None, max_side: int = 512) -> list[str]:
-    """Encode a [B, H, W, C] driving_video tensor into compact JPEG data URLs on CPU."""
-    if video_tensor is None or video_tensor.numel() == 0:
-        return []
-    return [_frame_to_data_url(video_tensor[i], max_side=max_side, quality=85) for i in range(video_tensor.shape[0])]
 
 
 def feather_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
@@ -129,18 +94,15 @@ def unpack_render_job_tensors(
 
 
 def build_fallback_passes(
-    front_image: torch.Tensor | None,
-    driving_video: torch.Tensor | None,
     depth_weight: float,
     render_width: int,
     render_height: int,
-    turntable_frames: int,
+    frame_count: int,
     mask_feather: int,
     anatomical_guides: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
     """Generate zero-VRAM CPU fallback passes when executed headless without a browser WebSocket."""
-    batch_size = int(driving_video.shape[0]) if driving_video is not None else int(turntable_frames)
-    batch_size = max(1, batch_size)
+    batch_size = max(1, int(frame_count) if int(frame_count) > 0 else 24)
 
     ys = torch.linspace(-1.0, 1.0, render_height, dtype=torch.float32)
     xs = torch.linspace(-1.0, 1.0, render_width, dtype=torch.float32)
@@ -173,10 +135,7 @@ def build_fallback_passes(
         torch.zeros((render_height, render_width, 3), dtype=torch.float32),
     )
 
-    if front_image is not None and front_image.numel() > 0:
-        avg_color = front_image[0].detach().to("cpu", dtype=torch.float32).mean(dim=(0, 1)).clamp(0.15, 0.95)
-    else:
-        avg_color = torch.tensor([0.75, 0.62, 0.55], dtype=torch.float32)
+    avg_color = torch.tensor([0.75, 0.62, 0.55], dtype=torch.float32)
 
     key_light = F.normalize(torch.tensor([0.45, 0.55, 0.70], dtype=torch.float32), dim=0)
     lambert = (norm_vec * key_light).sum(dim=-1).clamp(min=0.0)
@@ -211,7 +170,7 @@ def build_fallback_passes(
     pose_batch = pose_single.unsqueeze(0).repeat(batch_size, 1, 1, 1)
     feathered_mask = feather_mask(silhouette.unsqueeze(0).repeat(batch_size, 1, 1), mask_feather)
 
-    if batch_size > 1 and driving_video is None:
+    if batch_size > 1:
         angles = torch.linspace(-math.pi / 2, math.pi / 2, batch_size, dtype=torch.float32)
         mod = (0.88 + 0.12 * torch.cos(angles)).view(batch_size, 1, 1, 1)
         shaded_batch = (shaded_batch * mod).clamp(0.0, 1.0)
@@ -219,6 +178,8 @@ def build_fallback_passes(
 
     metadata = json.dumps({
         "projection": "ortho",
+        "fov_deg": 36,
+        "fps": 24,
         "resolution": [render_width, render_height],
         "frame_count": batch_size,
         "motion_source": "headless_fallback",
@@ -244,36 +205,6 @@ class YedpFace3D(io.ComfyNode):
             search_aliases=["face3d", "3d face", "mediapipe", "relight", "face mocap"],
             not_idempotent=True,
             inputs=[
-                io.Image.Input(
-                    "front_image",
-                    optional=True,
-                    tooltip="Primary front-facing reference portrait (optional if loaded via viewport stack).",
-                ),
-                io.Image.Input(
-                    "three_quarter_image",
-                    optional=True,
-                    tooltip="Optional 3/4 view photo for lateral cheek depth refinement.",
-                ),
-                io.Image.Input(
-                    "side_image",
-                    optional=True,
-                    tooltip="Optional side-profile photo for nose bridge, lips, chin, and jawline depth.",
-                ),
-                io.Image.Input(
-                    "driving_video",
-                    optional=True,
-                    tooltip="Optional driving video image batch for per-frame facial expression and head pose.",
-                ),
-                io.Image.Input(
-                    "three_quarter_2_image",
-                    optional=True,
-                    tooltip="Optional second 3/4 view photo (e.g. opposite side) for bilateral cheek/temple depth refinement.",
-                ),
-                io.Image.Input(
-                    "side_2_image",
-                    optional=True,
-                    tooltip="Optional second side-profile photo (e.g. opposite profile) for full bilateral jawline and nose depth.",
-                ),
                 io.Float.Input(
                     "depth_weight",
                     default=1.0,
@@ -299,12 +230,12 @@ class YedpFace3D(io.ComfyNode):
                     tooltip="Output render height for all exported passes.",
                 ),
                 io.Int.Input(
-                    "turntable_frames",
+                    "frame_count",
                     default=24,
-                    min=1,
-                    max=240,
+                    min=0,
+                    max=600,
                     step=1,
-                    tooltip="Frame count for the turntable sweep when no driving or recorded clip is active.",
+                    tooltip="Number of frames to render (0 = full mocap clip length; 1+ = exact frame count or clip slice).",
                 ),
                 io.Int.Input(
                     "mask_feather",
@@ -374,23 +305,15 @@ class YedpFace3D(io.ComfyNode):
         depth_weight: float,
         render_width: int,
         render_height: int,
-        turntable_frames: int,
+        frame_count: int,
         mask_feather: int,
         anatomical_guides: bool,
-        front_image: torch.Tensor | None = None,
-        three_quarter_image: torch.Tensor | None = None,
-        side_image: torch.Tensor | None = None,
-        driving_video: torch.Tensor | None = None,
-        three_quarter_2_image: torch.Tensor | None = None,
-        side_2_image: torch.Tensor | None = None,
     ) -> io.NodeOutput:
         prompt_server = getattr(PromptServer, "instance", None)
         node_id = getattr(cls.hidden, "unique_id", None)
         has_clients = bool(prompt_server is not None and getattr(prompt_server, "sockets", None))
 
         if prompt_server is not None and node_id is not None and has_clients:
-            driving_frames = _batch_to_data_urls(driving_video, max_side=512)
-            driving_batch_id = cache_driving_batch(driving_frames) if driving_frames else None
             job_id, job = create_render_job(render_width, render_height)
 
             try:
@@ -399,17 +322,10 @@ class YedpFace3D(io.ComfyNode):
                     {
                         "node_id": str(node_id),
                         "job_id": job_id,
-                        "front": _tensor_to_data_url(front_image),
-                        "three_quarter": _tensor_to_data_url(three_quarter_image),
-                        "three_quarter_2": _tensor_to_data_url(three_quarter_2_image),
-                        "side": _tensor_to_data_url(side_image),
-                        "side_2": _tensor_to_data_url(side_2_image),
                         "depth_weight": float(depth_weight),
-                        "driving_batch_id": driving_batch_id,
-                        "driving_frame_count": len(driving_frames),
                         "render_width": int(render_width),
                         "render_height": int(render_height),
-                        "turntable_frames": int(turntable_frames),
+                        "frame_count": int(frame_count),
                         "anatomical_guides": bool(anatomical_guides),
                     },
                 )
@@ -431,12 +347,10 @@ class YedpFace3D(io.ComfyNode):
                 pop_render_job(job_id)
 
         depth_t, normal_t, shaded_t, textured_t, pose_t, mask_t, meta = build_fallback_passes(
-            front_image=front_image,
-            driving_video=driving_video,
             depth_weight=depth_weight,
             render_width=render_width,
             render_height=render_height,
-            turntable_frames=turntable_frames,
+            frame_count=frame_count,
             mask_feather=mask_feather,
             anatomical_guides=anatomical_guides,
         )

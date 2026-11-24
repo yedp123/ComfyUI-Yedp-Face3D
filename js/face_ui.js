@@ -26,9 +26,9 @@ function syncNodeWidgets(node, viewport) {
         viewport.depthWeight = Number(depthWidget.value ?? 1.0);
     }
 
-    const turntableWidget = getWidget("turntable_frames");
-    if (turntableWidget) {
-        viewport.setTurntableFrames(turntableWidget.value ?? 24);
+    const frameCountWidget = getWidget("frame_count");
+    if (frameCountWidget) {
+        viewport.setFrameCount(frameCountWidget.value ?? 24);
     }
 
     const widthWidget = getWidget("render_width");
@@ -62,12 +62,12 @@ function bindNodeWidgets(node, viewport) {
         };
     }
 
-    const turntableWidget = getWidget("turntable_frames");
-    if (turntableWidget) {
-        const origCallback = turntableWidget.callback;
-        turntableWidget.callback = function (value) {
+    const frameCountWidget = getWidget("frame_count");
+    if (frameCountWidget) {
+        const origCallback = frameCountWidget.callback;
+        frameCountWidget.callback = function (value) {
             origCallback?.apply(this, arguments);
-            viewport.setTurntableFrames(value);
+            viewport.setFrameCount(value);
         };
     }
 
@@ -108,6 +108,10 @@ app.registerExtension({
                 onSelectRefFile: (viewKey, dataUrl, file) => viewport?.loadSingleReference(viewKey, dataUrl, file),
                 onResetAll: () => viewport?.clearAllReferences(),
                 onStatusError: (msg) => viewport?.setStatus(msg, true),
+                onExportStatic: (opts) => viewport?.exportGlb("static", opts),
+                onExportTexture: () => viewport?.exportUvTexturePng(),
+                onExportBlendshapes: (opts) => viewport?.exportGlb("blendshapes", opts),
+                onExportAnimation: (opts) => viewport?.exportGlb("animation", opts),
             });
             viewport = new FaceViewport(ui);
             this._yedpFaceViewport = viewport;
@@ -121,21 +125,14 @@ app.registerExtension({
             });
             domWidget.serialize = false;
 
-            const onSyncRefs = (event) => {
-                const detail = event?.detail;
-                if (!detail || !matchesNodeId(detail.node_id, this.id)) return;
-                viewport.loadReferenceImages(detail);
-            };
             const onRenderJob = (event) => {
                 const detail = event?.detail;
                 if (!detail || !matchesNodeId(detail.node_id, this.id)) return;
                 viewport.executeRenderJob(detail);
             };
-            api.addEventListener("yedp_face3d_sync_refs", onSyncRefs);
             api.addEventListener("yedp_face3d_render_job", onRenderJob);
 
             const cleanup = () => {
-                api.removeEventListener("yedp_face3d_sync_refs", onSyncRefs);
                 api.removeEventListener("yedp_face3d_render_job", onRenderJob);
                 viewport.dispose();
                 if (this._yedpFaceViewport === viewport) {

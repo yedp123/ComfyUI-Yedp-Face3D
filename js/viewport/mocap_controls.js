@@ -43,10 +43,16 @@ export function createMocapPanel(webcamOverlay) {
     Object.assign(webcamRow.style, { display: "flex", gap: "4px", alignItems: "center" });
 
     const webcamBtn = makePanelButton("Webcam", "Toggle live CPU webcam face tracking");
+    const loadVideoBtn = makePanelButton("Load Video", "Load a local video file (.mp4/.webm/.mov) for CPU mocap");
     const calibrateBtn = makePanelButton("Calibrate", "Set current webcam expression as neutral");
     calibrateBtn.style.display = "none";
 
-    webcamRow.append(webcamBtn, calibrateBtn);
+    const videoInput = document.createElement("input");
+    videoInput.type = "file";
+    videoInput.accept = "video/*";
+    videoInput.style.display = "none";
+
+    webcamRow.append(webcamBtn, loadVideoBtn, calibrateBtn, videoInput);
 
     const captureRow = document.createElement("div");
     Object.assign(captureRow.style, { display: "none", gap: "4px", alignItems: "center" });
@@ -73,15 +79,57 @@ export function createMocapPanel(webcamOverlay) {
     snapshotRow.append(snapToggleBtn, snapAngleBtn, clearSnapBtn);
 
     const playbackRow = document.createElement("div");
-    Object.assign(playbackRow.style, { display: "none", gap: "4px", alignItems: "center" });
+    Object.assign(playbackRow.style, {
+        display: "none",
+        flexDirection: "column",
+        gap: "4px",
+        padding: "5px 6px",
+        borderRadius: "5px",
+        backgroundColor: "rgba(15, 23, 42, 0.55)",
+        border: "1px solid rgba(255, 255, 255, 0.08)",
+    });
 
-    const playClipBtn = makePanelButton("Play Clip", "Play recorded webcam or driving video clip");
-    const clearClipBtn = makePanelButton("×", "Clear recorded motion clip");
+    const playbackBtnRow = document.createElement("div");
+    Object.assign(playbackBtnRow.style, { display: "flex", gap: "4px", alignItems: "center" });
+
+    const playClipBtn = makePanelButton("Play", "Play/pause recorded webcam or loaded video clip");
+    const snapClipBtn = makePanelButton("Snap", "Capture current scrubbed clip frame + camera angle as snapshot");
+    snapClipBtn.style.flex = "0 0 auto";
+    const setNeutralBtn = makePanelButton("Neutral", "Re-calibrate neutral pose/expression from current frame");
+    setNeutralBtn.style.flex = "0 0 auto";
+    const clearClipBtn = makePanelButton("×", "Clear motion clip");
     clearClipBtn.style.flex = "0 0 auto";
     clearClipBtn.style.padding = "4px 8px";
     clearClipBtn.style.color = "#fca5a5";
 
-    playbackRow.append(playClipBtn, clearClipBtn);
+    playbackBtnRow.append(playClipBtn, snapClipBtn, setNeutralBtn, clearClipBtn);
+
+    const scrubberRow = document.createElement("div");
+    Object.assign(scrubberRow.style, { display: "flex", gap: "5px", alignItems: "center" });
+
+    const clipScrubber = document.createElement("input");
+    clipScrubber.type = "range";
+    clipScrubber.min = "0";
+    clipScrubber.max = "0";
+    clipScrubber.step = "1";
+    clipScrubber.value = "0";
+    clipScrubber.style.flex = "1";
+    clipScrubber.style.minWidth = "0";
+    stopViewportEvents(clipScrubber);
+
+    const clipFrameLabel = document.createElement("span");
+    clipFrameLabel.textContent = "0/0";
+    Object.assign(clipFrameLabel.style, {
+        fontSize: "9px",
+        fontFamily: "ui-monospace, monospace",
+        color: "#cbd5e1",
+        minWidth: "38px",
+        textAlign: "right",
+        whiteSpace: "nowrap",
+    });
+
+    scrubberRow.append(clipScrubber, clipFrameLabel);
+    playbackRow.append(playbackBtnRow, scrubberRow);
 
     const motionStatus = document.createElement("div");
     Object.assign(motionStatus.style, {
@@ -96,6 +144,8 @@ export function createMocapPanel(webcamOverlay) {
     return {
         panel,
         webcamBtn,
+        loadVideoBtn,
+        videoInput,
         calibrateBtn,
         captureRow,
         recordBtn,
@@ -107,7 +157,11 @@ export function createMocapPanel(webcamOverlay) {
         clearSnapBtn,
         playbackRow,
         playClipBtn,
+        snapClipBtn,
+        setNeutralBtn,
         clearClipBtn,
+        clipScrubber,
+        clipFrameLabel,
         motionStatus,
     };
 }

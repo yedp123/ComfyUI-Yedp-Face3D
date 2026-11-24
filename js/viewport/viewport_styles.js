@@ -6,6 +6,7 @@ import { createWebcamOverlay } from "./webcam_overlay.js";
 import { createRefStackPanel } from "./ref_stack_panel.js";
 import { createMocapPanel } from "./mocap_controls.js";
 import { createRenderPanel } from "./render_controls.js";
+import { createExportPanel } from "./export_controls.js";
 import { createRightSidebar } from "./right_sidebar.js";
 import { stopViewportEvents } from "./ui_icons.js";
 
@@ -25,9 +26,15 @@ export function createViewportDOM(handlers) {
         onSelectRefFile,
         onResetAll,
         onStatusError,
+        onExportStatic,
+        onExportTexture,
+        onExportBlendshapes,
+        onExportAnimation,
     } = handlers;
 
     const container = document.createElement("div");
+    container.setAttribute?.("data-capture-wheel", "true");
+    container.tabIndex = -1;
     Object.assign(container.style, {
         position: "relative",
         width: "100%",
@@ -39,11 +46,19 @@ export function createViewportDOM(handlers) {
         background: "radial-gradient(circle at 40% 42%, #242936 0%, #12151c 100%)",
         userSelect: "none",
         boxSizing: "border-box",
-        display: "flex",
-        flexDirection: "row",
+        outline: "none",
         fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif",
     });
-    container.style.setProperty("--comfy-widget-min-height", "380");
+    container.style.setProperty?.("--comfy-widget-min-height", "380");
+
+    // Nodes 2.0 onWheelCapture only forwards wheel events to the widget when it is focused.
+    const ensureViewportFocus = () => {
+        const active = typeof document !== "undefined" ? document.activeElement : null;
+        if (active && container.contains?.(active)) return;
+        container.focus?.({ preventScroll: true });
+    };
+    container.addEventListener("pointerenter", ensureViewportFocus);
+    container.addEventListener("pointerdown", ensureViewportFocus, true);
 
     // Prevent wheel zoom inside the 3D viewport from zooming the ComfyUI node graph.
     container.addEventListener("wheel", (e) => e.stopPropagation());
@@ -67,6 +82,68 @@ export function createViewportDOM(handlers) {
         display: "block",
     });
     stage.appendChild(canvas);
+
+    // Maya-style Resolution Gate overlay (between WebGL canvas and HUD controls)
+    const resGateContainer = document.createElement("div");
+    Object.assign(resGateContainer.style, {
+        position: "absolute",
+        inset: "0",
+        pointerEvents: "none",
+        overflow: "hidden",
+        zIndex: "5",
+    });
+
+    const resGateBox = document.createElement("div");
+    Object.assign(resGateBox.style, {
+        position: "absolute",
+        left: "0px",
+        top: "0px",
+        width: "0px",
+        height: "0px",
+        boxSizing: "border-box",
+        border: "1px solid rgba(226, 232, 240, 0.42)",
+        boxShadow: "0 0 0 9999px rgba(8, 10, 15, 0.52)",
+        pointerEvents: "none",
+    });
+
+    const bracketSpecs = [
+        { top: "-1px", left: "-1px", borderTop: "2px solid #38bdf8", borderLeft: "2px solid #38bdf8" },
+        { top: "-1px", right: "-1px", borderTop: "2px solid #38bdf8", borderRight: "2px solid #38bdf8" },
+        { bottom: "-1px", left: "-1px", borderBottom: "2px solid #38bdf8", borderLeft: "2px solid #38bdf8" },
+        { bottom: "-1px", right: "-1px", borderBottom: "2px solid #38bdf8", borderRight: "2px solid #38bdf8" },
+    ];
+    for (const spec of bracketSpecs) {
+        const corner = document.createElement("div");
+        Object.assign(corner.style, {
+            position: "absolute",
+            width: "10px",
+            height: "10px",
+            pointerEvents: "none",
+            ...spec,
+        });
+        resGateBox.appendChild(corner);
+    }
+
+    const resGateLabel = document.createElement("span");
+    resGateLabel.textContent = "512×512 (1:1)";
+    Object.assign(resGateLabel.style, {
+        position: "absolute",
+        bottom: "4px",
+        right: "6px",
+        fontSize: "9px",
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+        fontWeight: "600",
+        color: "rgba(226, 232, 240, 0.85)",
+        backgroundColor: "rgba(15, 18, 25, 0.72)",
+        border: "1px solid rgba(255, 255, 255, 0.14)",
+        borderRadius: "4px",
+        padding: "1px 5px",
+        whiteSpace: "nowrap",
+        pointerEvents: "none",
+    });
+    resGateBox.appendChild(resGateLabel);
+    resGateContainer.appendChild(resGateBox);
+    stage.appendChild(resGateContainer);
 
     const hudLayer = document.createElement("div");
     Object.assign(hudLayer.style, {
@@ -194,6 +271,12 @@ export function createViewportDOM(handlers) {
     const webcamOverlay = createWebcamOverlay();
     const mocapPanel = createMocapPanel(webcamOverlay);
     const renderPanel = createRenderPanel(onRenderChange, onFitHead);
+    const exportPanel = createExportPanel({
+        onExportStatic,
+        onExportTexture,
+        onExportBlendshapes,
+        onExportAnimation,
+    });
 
     const rightSidebar = createRightSidebar([
         { id: "sculpt", title: "SCULPT", icon: "sculpt", body: sculptPanel.panel },
@@ -201,14 +284,29 @@ export function createViewportDOM(handlers) {
         { id: "lights", title: "LIGHTS", icon: "lights", body: lightPanel.panel },
         { id: "mocap", title: "MOCAP", icon: "mocap", body: mocapPanel.panel },
         { id: "render", title: "RENDER", icon: "render", body: renderPanel.panel },
+        { id: "export", title: "EXPORT", icon: "export", body: exportPanel.panel },
     ]);
 
-    container.append(stage, rightSidebar.element, webcamVideo);
+    const viewportBody = document.createElement("div");
+    Object.assign(viewportBody.style, {
+        position: "absolute",
+        inset: "0",
+        display: "flex",
+        flexDirection: "row",
+        overflow: "hidden",
+    });
+    viewportBody.append(stage, rightSidebar.element);
+    container.append(viewportBody, webcamVideo);
 
     return {
         container,
         stage,
         canvas,
+        resGate: {
+            container: resGateContainer,
+            box: resGateBox,
+            label: resGateLabel,
+        },
         hudLayer,
         refStack,
         badge,
@@ -224,5 +322,6 @@ export function createViewportDOM(handlers) {
         webcamOverlay,
         mocapPanel,
         renderPanel,
+        exportPanel,
     };
 }

@@ -3,10 +3,10 @@ import * as THREE from "../lib/three.module.js";
 import { OrbitControls } from "../lib/OrbitControls.js";
 import { getCanonicalFaceData, getHeadShellRig, ReconstructedFaceMesh } from "./face_mesh.js";
 import { renderAndUploadPasses } from "./offscreen_renderer.js";
+import { bakeFaceTexturePngBytes, exportFaceGlbBuffer } from "./glb_exporter.js";
 import { stopViewportEvents } from "./ui_icons.js";
 import {
     detectFaceForVideo,
-    detectOptionalFaceFromDataUrl,
     extractFaceFromDataUrl,
     getTesselationTriangles,
     resetImageLandmarker,
@@ -91,7 +91,7 @@ export class FaceViewport {
         this.lastIrisMaskScale = 1.08;
         this.onGuidesChanged = null;
         this.depthWeight = 1.0;
-        this.turntableFrames = 24;
+        this.frameCount = 24;
         this.viewportWidth = 480;
         this.viewportHeight = 380;
         this.outputWidth = 512;
@@ -100,14 +100,14 @@ export class FaceViewport {
         this.refUrls = createRefSlotMap(null);
         this.persistedRefs = createRefSlotMap(null);
         this.extractedViews = createRefSlotMap(null);
-        this.lastPythonSyncedRefs = null;
         this.loadToken = 0;
         this.resetToken = 0;
         this.viewTokens = createRefSlotMap(0);
         this.reconstructToken = 0;
+        this.videoLoadToken = 0;
         this.pendingRestoredCamera = null;
 
-        // Motion state (Turntable / Webcam / Recorded Clip / Driving Video)
+        // Motion state (Turntable / Webcam / Recorded Clip / Local Video)
         this.motionDriver = new MotionDriver();
         this.turntablePlaying = false;
         this.turntableCursor = 0;
@@ -117,11 +117,13 @@ export class FaceViewport {
         this.webcamBusy = false;
         this.webcamStream = null;
         this.isRecording = false;
+        this.recStartMs = 0;
         this.lastWebcamDetectMs = 0;
         this.lastWebcamFrame = null;
         this.isExporting = false;
 
         this.recordedClip = [];
+        this.clipFps = 24;
         this.clipSource = null;
         this.clipPlaying = false;
         this.clipCursor = 0;
@@ -133,13 +135,15 @@ export class FaceViewport {
 
         this.scene = new THREE.Scene();
         this.renderState = this.ui.renderPanel.getState();
+        this.renderFov = Number(this.renderState.fov || 36);
+        this.debugDrawerOpen = false;
 
         const initAspect = 480 / 380;
-        this.perspCamera = new THREE.PerspectiveCamera(this.renderState.fov || 36, initAspect, 0.05, 50);
+        this.perspCamera = new THREE.PerspectiveCamera(this.renderFov, initAspect, 0.05, 50);
         this.perspCamera.position.set(...DEFAULT_CAMERA_POS);
 
         const initDist = new THREE.Vector3(...DEFAULT_CAMERA_POS).distanceTo(new THREE.Vector3(...DEFAULT_TARGET));
-        this.orthoHalfH = initDist * Math.tan(THREE.MathUtils.degToRad((this.renderState.fov || 36) * 0.5));
+        this.orthoHalfH = initDist * Math.tan(THREE.MathUtils.degToRad(this.renderFov * 0.5));
         this.orthoCamera = new THREE.OrthographicCamera(
             -this.orthoHalfH * initAspect,
             this.orthoHalfH * initAspect,
@@ -321,45 +325,78 @@ export class FaceViewport {
         });
 
         // MOCAP controls
-        this.ui.mocapPanel.webcamBtn.addEventListener("click", (e) => {
+        const mp = this.ui.mocapPanel;
+        mp.webcamBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             this.toggleWebcam();
         });
-        this.ui.mocapPanel.calibrateBtn.addEventListener("click", (e) => {
+        mp.loadVideoBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            mp.videoInput.click();
+        });
+        mp.videoInput.addEventListener("change", () => {
+            const file = mp.videoInput.files?.[0];
+            mp.videoInput.value = "";
+            if (file) this.loadMocapVideoFile(file);
+        });
+        mp.panel.addEventListener("dragover", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+        });
+        mp.panel.addEventListener("drop", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const file = e.dataTransfer?.files?.[0];
+            if (file && (!file.type || file.type.startsWith("video/"))) {
+                this.loadMocapVideoFile(file);
+            }
+        });
+        mp.calibrateBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             this.motionDriver.calibrateNextFrame();
         });
-        this.ui.mocapPanel.recordBtn.addEventListener("click", (e) => {
+        mp.recordBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             this.toggleRecording();
         });
-        this.ui.mocapPanel.snapBtn.addEventListener("click", (e) => {
+        mp.snapBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             this.captureSnapshot();
         });
-        this.ui.mocapPanel.snapTimedBtn.addEventListener("click", (e) => {
+        mp.snapTimedBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             this.startSnapCountdown(3);
         });
-        this.ui.mocapPanel.snapToggleBtn.addEventListener("click", (e) => {
+        mp.snapToggleBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             this.toggleSnapshot();
         });
-        this.ui.mocapPanel.snapAngleBtn.addEventListener("click", (e) => {
+        mp.snapAngleBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             this.restoreSnapshotCamera();
         });
-        this.ui.mocapPanel.clearSnapBtn.addEventListener("click", (e) => {
+        mp.clearSnapBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             this.clearSnapshot();
         });
-        this.ui.mocapPanel.playClipBtn.addEventListener("click", (e) => {
+        mp.playClipBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             this.toggleClipPlayback();
         });
-        this.ui.mocapPanel.clearClipBtn.addEventListener("click", (e) => {
+        mp.snapClipBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.captureClipSnapshot();
+        });
+        mp.setNeutralBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.recalibrateClipAtFrame(Math.floor(this.clipCursor));
+        });
+        mp.clearClipBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             this.clearMotionClip();
+        });
+        mp.clipScrubber.addEventListener("input", () => {
+            this.scrubClipTo(Number(mp.clipScrubber.value));
         });
 
         // RENDER controls
@@ -495,7 +532,26 @@ export class FaceViewport {
             this.cycleUvDebugMode();
         });
 
-        bar.append(debugRow, this.relWeightBtn, phase23Row, mvTexRow);
+        this.debugToggleBtn = makeToggle("Debug ▾", "Toggle reconstruction & UV debug controls");
+        const debugDrawer = document.createElement("div");
+        Object.assign(debugDrawer.style, {
+            display: "none",
+            flexDirection: "column",
+            alignItems: "flex-end",
+            gap: "4px",
+        });
+        this.debugDrawer = debugDrawer;
+        this.debugToggleBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this.debugDrawerOpen = !this.debugDrawerOpen;
+            debugDrawer.style.display = this.debugDrawerOpen ? "flex" : "none";
+            this.debugToggleBtn.textContent = this.debugDrawerOpen ? "Debug ▴" : "Debug ▾";
+            this.debugToggleBtn.style.borderColor = this.debugDrawerOpen ? "#38bdf8" : "rgba(255, 255, 255, 0.16)";
+            this.debugToggleBtn.style.color = this.debugDrawerOpen ? "#38bdf8" : "#cbd5e1";
+        });
+
+        debugDrawer.append(debugRow, this.relWeightBtn, phase23Row, mvTexRow);
+        bar.append(this.debugToggleBtn, debugDrawer);
         this.ui.hudLayer.appendChild(bar);
         this.syncWeightDebugButtons();
     }
@@ -809,7 +865,7 @@ export class FaceViewport {
             projection: this.renderState?.projection || "ortho",
             orthoHalfH: this.orthoHalfH,
             orthoZoom: this.orthoCamera.zoom,
-            fov: this.perspCamera.fov,
+            fov: this.renderFov,
             position: this.camera.position.clone(),
             quaternion: this.camera.quaternion.clone(),
             target: this.controls.target.clone(),
@@ -831,8 +887,7 @@ export class FaceViewport {
         }
         this.orthoHalfH = cp.orthoHalfH;
         this.orthoCamera.zoom = cp.orthoZoom;
-        this.perspCamera.fov = cp.fov;
-        this.perspCamera.updateProjectionMatrix();
+        this.renderFov = Number(cp.fov || 36);
         this.controls.target.copy(cp.target);
         this.camera.position.copy(cp.position);
         this.camera.quaternion.copy(cp.quaternion);
@@ -938,8 +993,10 @@ export class FaceViewport {
         this.reconstructedFace?.applyRenderState(this.renderState);
 
         if (changedKey === "fov") {
-            this.perspCamera.fov = Number(state.fov || 36);
-            this.perspCamera.updateProjectionMatrix();
+            this.renderFov = Number(state.fov || 36);
+            this.applyResize(this.viewportWidth, this.viewportHeight);
+        } else if (changedKey === "showGate") {
+            this.applyResize(this.viewportWidth, this.viewportHeight);
         } else if (changedKey === "elevation") {
             const offset = this.camera.position.clone().sub(this.controls.target);
             const r = Math.max(offset.length(), 0.45);
@@ -952,14 +1009,24 @@ export class FaceViewport {
             );
             this.controls.update();
         } else if (changedKey === "projection" || changedKey === "reset") {
+            if (changedKey === "reset") {
+                this.renderFov = Number(state.fov || 36);
+            }
             if (state.projection !== prevProj || changedKey === "reset") {
                 this.switchCameraProjection(state.projection);
             }
             if (changedKey === "reset") {
                 this.resetCamera();
             }
+            this.applyResize(this.viewportWidth, this.viewportHeight);
         }
-        if (changedKey === "exportMode" || changedKey === "reset") {
+        if (
+            changedKey === "motionMode"
+            || changedKey === "spinMode"
+            || changedKey === "clipStart"
+            || changedKey === "lockHeadPose"
+            || changedKey === "reset"
+        ) {
             this.updateRenderUI();
             this.updateReadout();
         }
@@ -978,15 +1045,14 @@ export class FaceViewport {
         const dir = dist > 1e-5 ? offset.normalize() : new THREE.Vector3(0, 0, 1);
 
         if (nextIsOrtho) {
-            this.orthoHalfH = dist * Math.tan(THREE.MathUtils.degToRad((this.perspCamera.fov || 36) * 0.5));
+            this.orthoHalfH = dist * Math.tan(THREE.MathUtils.degToRad(this.renderFov * 0.5));
             this.orthoCamera.zoom = 1.0;
             this.orthoCamera.position.copy(oldCam.position);
         } else {
             const visHalfH = this.orthoHalfH / Math.max(this.orthoCamera.zoom, 1e-4);
-            this.perspCamera.fov = Number(this.renderState.fov || 36);
-            const newDist = Math.max(visHalfH / Math.tan(THREE.MathUtils.degToRad(this.perspCamera.fov * 0.5)), 0.45);
+            this.renderFov = Number(this.renderState.fov || 36);
+            const newDist = Math.max(visHalfH / Math.tan(THREE.MathUtils.degToRad(this.renderFov * 0.5)), 0.45);
             this.perspCamera.position.copy(target).addScaledVector(dir, newDist);
-            this.perspCamera.updateProjectionMatrix();
         }
 
         this.camera = newCam;
@@ -1007,8 +1073,7 @@ export class FaceViewport {
         const center = box.getCenter(new THREE.Vector3());
         const margin = 1.0 + Math.max(0.0, Number(rs.fitMargin ?? 0.12));
         const outAspect = this.outputWidth / Math.max(this.outputHeight, 1);
-        const viewAspect = this.viewportWidth / Math.max(this.viewportHeight, 1);
-        const limitingAspect = Math.min(outAspect, viewAspect);
+        const limitingAspect = outAspect;
         const reqHalfH = 0.5 * Math.max(size.y, size.x / Math.max(limitingAspect, 0.25)) * margin;
         const elRad = THREE.MathUtils.degToRad(rs.elevation || 0);
 
@@ -1024,15 +1089,15 @@ export class FaceViewport {
             );
             this.applyResize(this.viewportWidth, this.viewportHeight);
         } else {
-            this.perspCamera.fov = Number(rs.fov || 36);
-            const fovRad = THREE.MathUtils.degToRad(this.perspCamera.fov * 0.5);
+            this.renderFov = Number(rs.fov || 36);
+            const fovRad = THREE.MathUtils.degToRad(this.renderFov * 0.5);
             const dist = Math.max(reqHalfH / Math.tan(fovRad), size.z * 0.8 + 0.6);
             this.perspCamera.position.set(
                 center.x,
                 center.y + Math.sin(elRad) * dist,
                 center.z + Math.cos(elRad) * dist
             );
-            this.perspCamera.updateProjectionMatrix();
+            this.applyResize(this.viewportWidth, this.viewportHeight);
         }
         this.controls.update();
     }
@@ -1064,6 +1129,7 @@ export class FaceViewport {
             this.stopWebcam();
             return;
         }
+        this.videoLoadToken += 1;
         this.turntablePlaying = false;
         this.clipPlaying = false;
         this.snapshotActive = false;
@@ -1144,7 +1210,7 @@ export class FaceViewport {
         this.stopWebcam({ preserveSnapshot: true });
 
         if (this.ui.renderPanel) {
-            this.ui.renderPanel.setState({ exportMode: "single" }, false);
+            this.ui.renderPanel.setState({ motionMode: "snap", spinMode: "single" }, false);
             this.renderState = this.ui.renderPanel.getState();
         }
         if (this.reconstructedFace?.hasMesh) {
@@ -1220,6 +1286,10 @@ export class FaceViewport {
         if (wasActive) {
             this.reconstructedFace?.resetPose();
         }
+        if (this.renderState?.motionMode === "snap" && this.ui.renderPanel) {
+            this.ui.renderPanel.setState({ motionMode: "rest" }, false);
+            this.renderState = this.ui.renderPanel.getState();
+        }
         this.updateMotionUI();
         this.updateRenderUI();
         this.updateReadout();
@@ -1229,14 +1299,26 @@ export class FaceViewport {
         if (!this.webcamActive) return;
         if (this.isRecording) {
             this.isRecording = false;
+            const elapsedSec = Math.max((performance.now() - this.recStartMs) / 1000, 0.1);
+            if (this.recordedClip.length > 0) {
+                this.clipFps = Math.max(8, Math.min(30, Math.round(this.recordedClip.length / elapsedSec)));
+                this.clipCursor = 0;
+            }
             this.updateMotionUI();
             if (this.recordedClip.length > 0 && this.ui.renderPanel) {
-                this.ui.renderPanel.setState({ exportMode: "clip" }, true);
+                const curSpin = this.renderState?.spinMode || "turntable";
+                this.ui.renderPanel.setState(
+                    { motionMode: "clip", spinMode: curSpin === "single" ? "static" : curSpin },
+                    true
+                );
             }
             return;
         }
         this.recordedClip = [];
+        this.clipFps = 24;
+        this.clipCursor = 0;
         this.clipSource = "webcam";
+        this.recStartMs = performance.now();
         this.motionDriver.calibrateNextFrame();
         this.isRecording = true;
         this.updateMotionUI();
@@ -1246,29 +1328,223 @@ export class FaceViewport {
         if (!this.recordedClip.length) return;
         if (this.clipPlaying) {
             this.clipPlaying = false;
-            this.reconstructedFace.resetPose();
             this.updateMotionUI();
             return;
         }
         this.stopWebcam();
         this.snapshotActive = false;
         this.turntablePlaying = false;
-        this.clipCursor = 0;
+        if (this.clipCursor >= this.recordedClip.length) {
+            this.clipCursor = 0;
+        }
         this.clipPlaying = true;
         this.updateMotionUI();
         this.updateRenderUI();
         this.updateReadout();
     }
 
+    scrubClipTo(index) {
+        if (!this.recordedClip.length) return;
+        const clamped = Math.max(0, Math.min(this.recordedClip.length - 1, Math.floor(index)));
+        this.clipPlaying = false;
+        this.snapshotActive = false;
+        this.turntablePlaying = false;
+        this.clipCursor = clamped;
+        if (this.reconstructedFace?.hasMesh) {
+            this.reconstructedFace.applyMotionFrame(this.recordedClip[clamped]);
+        }
+        this.updateMotionUI();
+    }
+
+    captureClipSnapshot(index = Math.floor(this.clipCursor)) {
+        if (!this.recordedClip.length) return false;
+        const clamped = Math.max(0, Math.min(this.recordedClip.length - 1, Math.floor(index)));
+        const srcFrame = this.recordedClip[clamped];
+        if (!srcFrame) return false;
+
+        this.clipPlaying = false;
+        this.turntablePlaying = false;
+        this.snapshotPose = {
+            motionFrame: cloneMotionFrame(srcFrame),
+            cameraPose: this.captureCameraPose(),
+        };
+        this.snapshotActive = true;
+        if (this.ui.renderPanel) {
+            this.ui.renderPanel.setState({ motionMode: "snap", spinMode: "single" }, false);
+            this.renderState = this.ui.renderPanel.getState();
+        }
+        if (this.reconstructedFace?.hasMesh) {
+            this.reconstructedFace.applyMotionFrame(this.snapshotPose.motionFrame);
+        }
+        this.updateMotionUI();
+        this.updateRenderUI();
+        this.updateReadout();
+        this.setStatus(`Snapshot saved from frame ${clamped + 1} (Single mode ready)`);
+        return true;
+    }
+
+    recalibrateClipAtFrame(index = Math.floor(this.clipCursor)) {
+        if (!this.recordedClip.length) return false;
+        const clamped = Math.max(0, Math.min(this.recordedClip.length - 1, Math.floor(index)));
+        const refRaw = this.recordedClip[clamped]?._rawDet;
+        if (!refRaw) {
+            this.setStatus("Current clip lacks raw landmarks for neutral recalibration", true);
+            return false;
+        }
+        const mirror = Boolean(this.recordedClip[clamped].mirror);
+        const drv = new MotionDriver();
+        drv.processDetection(refRaw, { mirrorYaw: mirror, smoothAlpha: 1.0 });
+        drv.hasPrev = false;
+        drv.smoothedDeltas = null;
+
+        const nextClip = [];
+        for (let i = 0; i < this.recordedClip.length; i++) {
+            const raw = this.recordedClip[i]?._rawDet;
+            if (!raw) continue;
+            const m = drv.processDetection(raw, {
+                mirrorYaw: Boolean(this.recordedClip[i].mirror),
+                smoothAlpha: i === clamped ? 1.0 : (mirror ? 0.45 : 0.55),
+            });
+            if (m) {
+                m._rawDet = raw;
+                nextClip.push(m);
+            }
+        }
+        if (!nextClip.length) return false;
+
+        this.recordedClip = nextClip;
+        this.clipCursor = Math.min(clamped, nextClip.length - 1);
+        if (this.reconstructedFace?.hasMesh) {
+            this.reconstructedFace.applyMotionFrame(this.recordedClip[this.clipCursor]);
+        }
+        this.updateMotionUI();
+        this.setStatus(`Neutral recalibrated at frame ${this.clipCursor + 1}`);
+        return true;
+    }
+
+    async loadMocapVideoFile(file) {
+        if (!file || this.disposed) return;
+        const token = ++this.videoLoadToken;
+        this.stopWebcam();
+        this.turntablePlaying = false;
+        this.clipPlaying = false;
+        this.snapshotActive = false;
+
+        const mp = this.ui.mocapPanel;
+        const objectUrl = URL.createObjectURL(file);
+        const video = document.createElement("video");
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = "auto";
+
+        try {
+            mp.motionStatus.textContent = "Loading video metadata...";
+            mp.motionStatus.style.color = "#38bdf8";
+
+            await new Promise((resolve, reject) => {
+                video.onloadedmetadata = () => resolve();
+                video.onerror = () => reject(new Error("Unsupported or unreadable video file."));
+                video.src = objectUrl;
+            });
+            if (this.disposed || token !== this.videoLoadToken) return;
+
+            const duration = Number(video.duration);
+            if (!Number.isFinite(duration) || duration <= 0) {
+                throw new Error("Could not read video duration.");
+            }
+
+            const targetFps = 24;
+            const totalSteps = Math.min(MAX_RECORDED_FRAMES, Math.max(1, Math.floor(duration * targetFps)));
+            const baseTs = performance.now();
+            this.motionDriver.reset();
+            const clip = [];
+
+            for (let i = 0; i < totalSteps; i++) {
+                if (this.disposed || token !== this.videoLoadToken) return;
+                const targetTime = Math.min(Math.max(duration - 0.001, 0), i / targetFps);
+                if (Math.abs(video.currentTime - targetTime) > 1e-4) {
+                    await new Promise((resolve) => {
+                        const onSeeked = () => {
+                            video.removeEventListener("seeked", onSeeked);
+                            resolve();
+                        };
+                        video.addEventListener("seeked", onSeeked);
+                        video.currentTime = targetTime;
+                    });
+                }
+                if (this.disposed || token !== this.videoLoadToken) return;
+
+                const det = await detectFaceForVideo(video, baseTs + i * (1000 / targetFps));
+                if (this.disposed || token !== this.videoLoadToken) return;
+
+                if (det) {
+                    const m = this.motionDriver.processDetection(det, { mirrorYaw: false, smoothAlpha: 0.55 });
+                    if (m) {
+                        m._rawDet = det;
+                        clip.push(m);
+                    }
+                } else if (clip.length > 0) {
+                    clip.push(clip[clip.length - 1]);
+                }
+
+                if ((i + 1) % 4 === 0 || i + 1 === totalSteps) {
+                    mp.motionStatus.textContent = `Loading video ${i + 1}/${totalSteps}f...`;
+                }
+                if (i % 2 === 1) {
+                    await new Promise((resolve) => setTimeout(resolve, 0));
+                }
+            }
+
+            if (this.disposed || token !== this.videoLoadToken) return;
+            if (!clip.length) {
+                throw new Error("No face detected in video.");
+            }
+
+            this.recordedClip = clip;
+            this.clipFps = targetFps;
+            this.clipSource = "video";
+            this.clipCursor = 0;
+            this.clipPlaying = true;
+            if (this.ui.renderPanel) {
+                const curSpin = this.renderState?.spinMode || "turntable";
+                this.ui.renderPanel.setState(
+                    { motionMode: "clip", spinMode: curSpin === "single" ? "static" : curSpin },
+                    false
+                );
+                this.renderState = this.ui.renderPanel.getState();
+            }
+            if (this.reconstructedFace?.hasMesh) {
+                this.reconstructedFace.applyMotionFrame(clip[0]);
+            }
+            this.updateMotionUI();
+            this.updateRenderUI();
+            this.updateReadout();
+            this.setStatus(`Video Mocap Ready (${clip.length}f @ ${targetFps}fps)`);
+        } catch (err) {
+            if (this.disposed || token !== this.videoLoadToken) return;
+            console.error("[YedpFace3D] Video mocap load failed:", err);
+            mp.motionStatus.textContent = `Video error: ${err.message}`;
+            mp.motionStatus.style.color = "#f87171";
+            this.setStatus(`Video error: ${err.message}`, true);
+        } finally {
+            URL.revokeObjectURL(objectUrl);
+            video.removeAttribute("src");
+            video.load?.();
+        }
+    }
+
     clearMotionClip() {
+        this.videoLoadToken += 1;
         this.clipPlaying = false;
         this.isRecording = false;
         this.recordedClip = [];
+        this.clipFps = 24;
+        this.clipCursor = 0;
         this.clipSource = null;
         this.motionDriver.reset();
         this.reconstructedFace?.resetPose();
-        if (this.renderState?.exportMode === "clip" && this.ui.renderPanel) {
-            this.ui.renderPanel.setState({ exportMode: "turntable" }, false);
+        if (this.renderState?.motionMode === "clip" && this.ui.renderPanel) {
+            this.ui.renderPanel.setState({ motionMode: "rest" }, false);
             this.renderState = this.ui.renderPanel.getState();
         }
         this.updateMotionUI();
@@ -1296,9 +1572,16 @@ export class FaceViewport {
         mp.snapToggleBtn.style.color = this.snapshotActive ? "#38bdf8" : "#cbd5e1";
 
         const hasClip = this.recordedClip.length > 0;
+        const curIdx = hasClip ? Math.max(0, Math.min(this.recordedClip.length - 1, Math.floor(this.clipCursor))) : 0;
         mp.playbackRow.style.display = hasClip ? "flex" : "none";
         mp.playClipBtn.style.borderColor = this.clipPlaying ? "#38bdf8" : "rgba(255,255,255,0.16)";
-        mp.playClipBtn.textContent = this.clipPlaying ? "Stop Clip" : `Play (${this.recordedClip.length}f)`;
+        mp.playClipBtn.textContent = this.clipPlaying ? "Pause" : "Play";
+        mp.clipScrubber.max = String(Math.max(0, this.recordedClip.length - 1));
+        mp.clipScrubber.value = String(curIdx);
+        mp.clipFrameLabel.textContent = hasClip ? `${curIdx + 1}/${this.recordedClip.length}` : "0/0";
+        mp.setNeutralBtn.disabled = !hasClip || !this.recordedClip[curIdx]?._rawDet;
+        mp.setNeutralBtn.style.opacity = mp.setNeutralBtn.disabled ? "0.45" : "1.0";
+        this.ui.exportPanel?.setAnimEnabled(hasClip, this.recordedClip.length);
 
         if (this.snapCountdownRemaining > 0) {
             mp.motionStatus.textContent = `Hold pose · Snap in ${this.snapCountdownRemaining}s...`;
@@ -1310,7 +1593,7 @@ export class FaceViewport {
             mp.motionStatus.textContent = "LIVE tracking active";
             mp.motionStatus.style.color = "#4ade80";
         } else if (this.clipPlaying) {
-            mp.motionStatus.textContent = `Playing clip (${this.recordedClip.length}f)`;
+            mp.motionStatus.textContent = `Playing ${curIdx + 1}/${this.recordedClip.length}f @ ${this.clipFps || 24}fps`;
             mp.motionStatus.style.color = "#38bdf8";
         } else if (this.snapshotActive && hasSnap) {
             mp.motionStatus.textContent = "Snapshot active · Single ready";
@@ -1319,22 +1602,99 @@ export class FaceViewport {
             mp.motionStatus.textContent = "Snapshot saved (mesh neutral)";
             mp.motionStatus.style.color = "#94a3b8";
         } else {
-            mp.motionStatus.textContent = hasClip ? `Clip ready: ${this.recordedClip.length}f` : "No active mocap";
+            mp.motionStatus.textContent = hasClip ? `Clip ready: ${this.recordedClip.length}f @ ${this.clipFps || 24}fps` : "No active mocap";
             mp.motionStatus.style.color = "#94a3b8";
         }
     }
 
     getExportPlan() {
-        const mode = this.renderState?.exportMode || "turntable";
-        const snapTag = this.snapshotActive && this.snapshotPose ? "Snap·" : "";
-        if (mode === "single") {
-            return { mode: "single", label: `${snapTag}Single`, frames: 1 };
+        const rs = this.renderState || {};
+        const motionMode = rs.motionMode || "rest";
+        const spinMode = rs.spinMode || "turntable";
+        const reqFrames = Math.max(0, Math.floor(this.frameCount));
+        const hasClip = this.recordedClip.length > 0;
+        const startIdx = hasClip
+            ? Math.max(0, Math.min(this.recordedClip.length - 1, Math.floor((rs.clipStart ?? 1) - 1)))
+            : 0;
+        const availClip = hasClip ? Math.max(1, this.recordedClip.length - startIdx) : 0;
+
+        let frames;
+        if (spinMode === "single") {
+            frames = 1;
+        } else if (motionMode === "clip") {
+            frames = hasClip ? (reqFrames > 0 ? Math.min(reqFrames, availClip) : availClip) : 0;
+        } else {
+            frames = reqFrames > 0 ? reqFrames : 1;
         }
-        if (mode === "clip") {
-            const count = this.recordedClip.length;
-            return { mode: "clip", label: count > 0 ? "Clip" : "No Clip", frames: count };
+
+        const mLabel = motionMode === "clip" ? (hasClip ? "Clip" : "No Clip") : motionMode === "snap" ? "Snap" : "Rest";
+        const sLabel = spinMode === "single" ? "1f" : spinMode === "turntable" ? "Turn" : "Static";
+        return { motionMode, spinMode, startIdx, label: `${mLabel}·${sLabel}`, frames };
+    }
+
+    _triggerLocalDownload(bytes, filename, mimeType) {
+        const blob = new Blob([bytes], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        a.style.display = "none";
+        document.body?.appendChild?.(a);
+        a.click();
+        a.remove?.();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    async exportUvTexturePng() {
+        const ep = this.ui.exportPanel;
+        if (!this.reconstructedFace?.hasMesh) {
+            ep?.setStatus("Load or wait for 3D mesh first", true);
+            return;
         }
-        return { mode: "turntable", label: `${snapTag}Turntable`, frames: this.turntableFrames };
+        try {
+            ep?.setStatus("Exporting UV PNG...");
+            const pngBytes = await bakeFaceTexturePngBytes(this.reconstructedFace, 1024);
+            const filename = "yedp_face_uv.png";
+            this._triggerLocalDownload(pngBytes, filename, "image/png");
+            ep?.setStatus(`Saved ${filename} (${(pngBytes.byteLength / 1024).toFixed(0)} KB)`);
+        } catch (err) {
+            console.error("[YedpFace3D] UV PNG export failed:", err);
+            ep?.setStatus(`Export error: ${err.message}`, true);
+        }
+    }
+
+    async exportGlb(mode, opts = {}) {
+        const ep = this.ui.exportPanel;
+        if (!this.reconstructedFace?.hasMesh) {
+            ep?.setStatus("Load or wait for 3D mesh first", true);
+            return;
+        }
+        try {
+            ep?.setStatus("Building GLB...");
+            const glbBytes = await exportFaceGlbBuffer(this.reconstructedFace, {
+                mode,
+                scope: opts.scope || "head",
+                subdiv: opts.subdiv || "smooth",
+                pose: opts.pose || "rest",
+                includeEyeballs: opts.includeEyeballs !== false,
+                animMode: opts.animMode || "arkit",
+                motionClip: this.recordedClip,
+                clipFps: this.clipFps || 24,
+            });
+            const scopeTag = opts.scope === "face" ? "face" : "head";
+            const nameMap = {
+                static: `yedp_${scopeTag}_static.glb`,
+                blendshapes: `yedp_${scopeTag}_blendshapes.glb`,
+                animation: `yedp_${scopeTag}_anim.glb`,
+            };
+            const filename = nameMap[mode] || "yedp_face3d.glb";
+            this._triggerLocalDownload(glbBytes, filename, "model/gltf-binary");
+            const mb = (glbBytes.byteLength / (1024 * 1024)).toFixed(2);
+            ep?.setStatus(`Saved ${filename} (${mb} MB)`);
+        } catch (err) {
+            console.error("[YedpFace3D] GLB export failed:", err);
+            ep?.setStatus(`Export error: ${err.message}`, true);
+        }
     }
 
     updateRenderUI() {
@@ -1363,7 +1723,6 @@ export class FaceViewport {
         const resetToken = this.resetToken;
         const slotToken = ++this.viewTokens[viewKey];
         this.loadToken++;
-        this.lastPythonSyncedRefs = null;
         this.refUrls[viewKey] = dataUrl;
         this.persistedRefs[viewKey] = null;
         this.ui.refStack.setPreview(viewKey, dataUrl, false);
@@ -1419,7 +1778,6 @@ export class FaceViewport {
         this.reconstructToken++;
         this.bakeToken++;
         this.lastBakeResult = null;
-        this.lastPythonSyncedRefs = null;
         this.refUrls[viewKey] = null;
         this.persistedRefs[viewKey] = null;
         this.extractedViews[viewKey] = null;
@@ -1450,133 +1808,6 @@ export class FaceViewport {
 
         if (resetToken === this.resetToken) {
             await this.runReconstruction();
-        }
-    }
-
-    async loadReferenceImages({
-        front,
-        three_quarter = null,
-        three_quarter_2 = null,
-        side = null,
-        side_2 = null,
-        depth_weight = null,
-        driving_batch_id = null,
-        driving_frame_count = 0,
-    }) {
-        if (this.disposed) return;
-        const resetToken = ++this.resetToken;
-        const token = ++this.loadToken;
-        this.persistedRefs = createRefSlotMap(null);
-
-        if (depth_weight !== null && depth_weight !== undefined) {
-            this.depthWeight = Number(depth_weight);
-        }
-
-        const incoming = {
-            front: front || null,
-            three_quarter,
-            three_quarter_2,
-            side,
-            side_2,
-        };
-        this.refUrls = { ...incoming };
-        for (const key of REF_VIEW_KEYS) {
-            this.viewTokens[key] = (this.viewTokens[key] || 0) + 1;
-            this.ui.refStack.setPreview(key, incoming[key], false);
-        }
-        this.setStatus("Extracting landmarks (CPU)...");
-
-        try {
-            const extractedList = await Promise.all(
-                REF_VIEW_KEYS.map(async (key) => {
-                    const url = incoming[key];
-                    if (!url) return null;
-                    const [extracted, segMaskPng] = await Promise.all([
-                        extractFaceFromDataUrl(url),
-                        segmentImageDataUrl(url),
-                    ]);
-                    if (extracted) {
-                        extracted.segMaskPng = segMaskPng || null;
-                    }
-                    return extracted;
-                })
-            );
-
-            if (this.disposed || resetToken !== this.resetToken || token !== this.loadToken) return;
-            const frontData = extractedList[0];
-            if (!frontData) {
-                this.setStatus("No face in front_image", true);
-                return;
-            }
-
-            const nextViews = createRefSlotMap(null);
-            REF_VIEW_KEYS.forEach((key, idx) => {
-                nextViews[key] = extractedList[idx];
-            });
-            this.lastBakeResult = null;
-            this.bakeToken++;
-            this.extractedViews = nextViews;
-            await this.runReconstruction();
-
-            if (driving_batch_id && driving_frame_count > 0 && token === this.loadToken) {
-                await this.loadDrivingBatch(driving_batch_id, driving_frame_count, token);
-            }
-        } catch (err) {
-            if (this.disposed || token !== this.loadToken) return;
-            console.error("[YedpFace3D] Landmark extraction failed:", err);
-            this.setStatus(`Error: ${err.message}`, true);
-        }
-    }
-
-    async loadDrivingBatch(batchId, count, token = this.loadToken) {
-        try {
-            this.setStatus(`Extracting driving video (0/${count})...`);
-            const res = await api.fetchApi(`/yedp_face3d/driving_batch/${batchId}`);
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
-            const frames = data.frames || [];
-            if (!frames.length || this.disposed || token !== this.loadToken) return;
-
-            this.motionDriver.reset();
-            const clip = [];
-            for (let i = 0; i < frames.length; i++) {
-                if (this.disposed || token !== this.loadToken) return;
-                const det = await detectOptionalFaceFromDataUrl(frames[i]);
-                if (this.disposed || token !== this.loadToken) return;
-                if (det) {
-                    const m = this.motionDriver.processDetection(det, { mirrorYaw: false, smoothAlpha: 0.55 });
-                    if (m) clip.push(m);
-                } else if (clip.length > 0) {
-                    clip.push(clip[clip.length - 1]);
-                }
-                if ((i + 1) % 4 === 0 || i + 1 === frames.length) {
-                    this.setStatus(`Extracting driving video (${i + 1}/${frames.length})...`);
-                }
-                if (i % 2 === 1) {
-                    await new Promise((resolve) => setTimeout(resolve, 0));
-                }
-            }
-
-            if (clip.length > 0 && token === this.loadToken) {
-                const hadDriving = this.clipSource === "driving";
-                this.recordedClip = clip;
-                this.clipSource = "driving";
-                this.turntablePlaying = false;
-                this.clipCursor = 0;
-                this.clipPlaying = true;
-                if (!hadDriving && this.ui.renderPanel) {
-                    this.ui.renderPanel.setState({ exportMode: "clip" }, false);
-                    this.renderState = this.ui.renderPanel.getState();
-                }
-                this.updateMotionUI();
-                this.updateRenderUI();
-                this.updateReadout();
-                this.setStatus(`Driving Video Ready (${clip.length}f)`);
-            }
-        } catch (err) {
-            if (this.disposed || token !== this.loadToken) return;
-            console.error("[YedpFace3D] Driving batch failed:", err);
-            this.setStatus(`Video error: ${err.message}`, true);
         }
     }
 
@@ -1703,22 +1934,15 @@ export class FaceViewport {
         if (this.disposed || !detail?.job_id) return;
         const {
             job_id,
-            front = null,
-            three_quarter = null,
-            three_quarter_2 = null,
-            side = null,
-            side_2 = null,
             depth_weight = null,
-            driving_batch_id = null,
-            driving_frame_count = 0,
             render_width = this.outputWidth,
             render_height = this.outputHeight,
-            turntable_frames = this.turntableFrames,
+            frame_count = this.frameCount,
             anatomical_guides = this.guidesVisible,
         } = detail;
 
         try {
-            if (!front && !this.reconstructedFace?.hasMesh && this._defaultHeadPromise) {
+            if (!this.reconstructedFace?.hasMesh && this._defaultHeadPromise) {
                 try {
                     await this._defaultHeadPromise;
                 } catch {
@@ -1729,53 +1953,9 @@ export class FaceViewport {
 
             this.setGuidesVisible(anatomical_guides);
             this.setOutputResolution(render_width, render_height);
-            this.setTurntableFrames(turntable_frames);
-
-            if (!driving_batch_id && this.clipSource === "driving") {
-                this.clearMotionClip();
-            }
-
-            const exportMode = this.ui.renderPanel.getState().exportMode || "turntable";
-            const needDrivingDecode = Boolean(
-                driving_batch_id
-                && driving_frame_count > 0
-                && (exportMode === "clip" || this.clipSource !== "driving")
-            );
-
-            if (front) {
-                const sameRefs = this.lastPythonSyncedRefs
-                    && this.lastPythonSyncedRefs.front === front
-                    && this.lastPythonSyncedRefs.three_quarter === three_quarter
-                    && this.lastPythonSyncedRefs.three_quarter_2 === three_quarter_2
-                    && this.lastPythonSyncedRefs.side === side
-                    && this.lastPythonSyncedRefs.side_2 === side_2
-                    && Number(this.lastPythonSyncedRefs.depth_weight) === Number(depth_weight)
-                    && this.reconstructedFace.hasMesh;
-
-                if (!sameRefs) {
-                    await this.loadReferenceImages({
-                        front,
-                        three_quarter,
-                        three_quarter_2,
-                        side,
-                        side_2,
-                        depth_weight,
-                        driving_batch_id: needDrivingDecode ? driving_batch_id : null,
-                        driving_frame_count: needDrivingDecode ? driving_frame_count : 0,
-                    });
-                    this.lastPythonSyncedRefs = {
-                        front,
-                        three_quarter,
-                        three_quarter_2,
-                        side,
-                        side_2,
-                        depth_weight,
-                    };
-                } else if (needDrivingDecode) {
-                    await this.loadDrivingBatch(driving_batch_id, driving_frame_count, this.loadToken);
-                }
-            } else if (needDrivingDecode) {
-                await this.loadDrivingBatch(driving_batch_id, driving_frame_count, this.loadToken);
+            this.setFrameCount(frame_count);
+            if (depth_weight !== null && depth_weight !== undefined) {
+                this.setDepthWeight(depth_weight);
             }
 
             if (this.disposed) return;
@@ -1805,9 +1985,12 @@ export class FaceViewport {
                     reconstructedFace: this.reconstructedFace,
                     placeholderHead: null,
                     motionClip: this.recordedClip,
+                    clipFps: this.clipFps || 24,
                     snapshotFrame: this.snapshotActive ? this.snapshotPose?.motionFrame : null,
-                    turntableFrames: turntable_frames,
+                    frameCount: frame_count,
                     renderState: this.renderState,
+                    orthoHalfH: this.orthoHalfH,
+                    renderFov: this.renderFov,
                     width: render_width,
                     height: render_height,
                     onProgress: (done, total) => {
@@ -1845,9 +2028,9 @@ export class FaceViewport {
         this.loadToken++;
         this.reconstructToken++;
         this.bakeToken++;
+        this.videoLoadToken++;
         this.lastBakeResult = null;
         this.pendingRestoredCamera = null;
-        this.lastPythonSyncedRefs = null;
         this.stopWebcam();
         this.turntablePlaying = false;
         this.turntableCursor = 0;
@@ -1925,7 +2108,6 @@ export class FaceViewport {
         const resetToken = ++this.resetToken;
         this.loadToken += 1;
         this.reconstructToken += 1;
-        this.lastPythonSyncedRefs = null;
         this.stopWebcam();
         this.cancelSnapCountdown();
         this.turntablePlaying = false;
@@ -1952,8 +2134,32 @@ export class FaceViewport {
             this.ui.lightPanel.setState(saved.lights, false);
         }
         if (saved.render && this.ui.renderPanel?.setState) {
-            this.ui.renderPanel.setState(saved.render, false);
+            const sr = { ...saved.render };
+            if (!sr.motionMode || !sr.spinMode) {
+                const legacy = sr.exportMode || "turntable";
+                if (legacy === "clip") {
+                    sr.motionMode = "clip";
+                    sr.spinMode = "static";
+                } else if (legacy === "single") {
+                    sr.motionMode = "snap";
+                    sr.spinMode = "single";
+                } else {
+                    sr.motionMode = "rest";
+                    sr.spinMode = "turntable";
+                }
+                delete sr.exportMode;
+            }
+            this.ui.renderPanel.setState(
+                {
+                    ...sr,
+                    clipStart: Math.max(1, Math.floor(Number(sr.clipStart) || 1)),
+                    lockHeadPose: Boolean(sr.lockHeadPose),
+                    showGate: sr.showGate !== false,
+                },
+                false,
+            );
             this.renderState = this.ui.renderPanel.getState();
+            this.renderFov = Number(this.renderState.fov || 36);
             this.ui.renderPanel.syncProjectionUI?.();
         }
 
@@ -2111,8 +2317,8 @@ export class FaceViewport {
         }
     }
 
-    setTurntableFrames(frames) {
-        this.turntableFrames = Math.max(1, Number(frames) || 24);
+    setFrameCount(frames) {
+        this.frameCount = Math.max(0, Number(frames) ?? 24);
         this.updateRenderUI();
         this.updateReadout();
     }
@@ -2125,7 +2331,8 @@ export class FaceViewport {
         }
         this.controls.target.set(...DEFAULT_TARGET);
         const dist = new THREE.Vector3(...DEFAULT_CAMERA_POS).distanceTo(new THREE.Vector3(...DEFAULT_TARGET));
-        this.orthoHalfH = dist * Math.tan(THREE.MathUtils.degToRad((this.renderState.fov || 36) * 0.5));
+        this.renderFov = Number(this.renderState.fov || 36);
+        this.orthoHalfH = dist * Math.tan(THREE.MathUtils.degToRad(this.renderFov * 0.5));
         this.orthoCamera.zoom = 1.0;
         this.perspCamera.position.set(...DEFAULT_CAMERA_POS);
         this.orthoCamera.position.set(...DEFAULT_CAMERA_POS);
@@ -2142,8 +2349,44 @@ export class FaceViewport {
     setOutputResolution(width, height) {
         this.outputWidth = Math.max(1, Number(width) || 512);
         this.outputHeight = Math.max(1, Number(height) || 512);
-        this.updateReadout();
+        this.applyResize(this.viewportWidth, this.viewportHeight);
         this.updateRenderUI();
+    }
+
+    computeResolutionGate(vw, vh, outW = this.outputWidth, outH = this.outputHeight, showGate = true) {
+        const safeOutW = Math.max(1, Number(outW) || 512);
+        const safeOutH = Math.max(1, Number(outH) || 512);
+        const overscan = showGate ? 0.92 : 1.0;
+        const fitScale = Math.min(vw / safeOutW, vh / safeOutH) * overscan;
+        const gateW = safeOutW * fitScale;
+        const gateH = safeOutH * fitScale;
+        return {
+            gateW,
+            gateH,
+            gateLeft: (vw - gateW) * 0.5,
+            gateTop: (vh - gateH) * 0.5,
+        };
+    }
+
+    updateResolutionGateOverlay(gate, showGate) {
+        const rg = this.ui?.resGate;
+        if (!rg) return;
+        rg.container.style.display = showGate ? "block" : "none";
+        if (!showGate) return;
+
+        rg.box.style.left = `${gate.gateLeft.toFixed(2)}px`;
+        rg.box.style.top = `${gate.gateTop.toFixed(2)}px`;
+        rg.box.style.width = `${gate.gateW.toFixed(2)}px`;
+        rg.box.style.height = `${gate.gateH.toFixed(2)}px`;
+
+        const gcd = (a, b) => (b === 0 ? a : gcd(b, a % b));
+        const wInt = Math.round(this.outputWidth);
+        const hInt = Math.round(this.outputHeight);
+        const d = gcd(wInt, hInt) || 1;
+        const rw = Math.round(wInt / d);
+        const rh = Math.round(hInt / d);
+        const ratioText = rw <= 32 && rh <= 32 ? `${rw}:${rh}` : (wInt / Math.max(hInt, 1)).toFixed(2);
+        rg.label.textContent = `${wInt}×${hInt} (${ratioText})`;
     }
 
     observeResize() {
@@ -2175,19 +2418,27 @@ export class FaceViewport {
 
         this.viewportWidth = w;
         this.viewportHeight = h;
-        const aspect = w / h;
+        const viewAspect = w / h;
+        const showGate = this.renderState?.showGate !== false;
+        const gate = this.computeResolutionGate(w, h, this.outputWidth, this.outputHeight, showGate);
+        const heightScale = h / Math.max(gate.gateH, 1e-4);
 
         // Pass updateStyle=false so canvas CSS stays 100% and avoids ResizeObserver loops.
         this.renderer.setSize(w, h, false);
-        this.perspCamera.aspect = aspect;
+
+        const halfOutFovRad = THREE.MathUtils.degToRad((this.renderFov || 36) * 0.5);
+        this.perspCamera.fov = THREE.MathUtils.radToDeg(2.0 * Math.atan(Math.tan(halfOutFovRad) * heightScale));
+        this.perspCamera.aspect = viewAspect;
         this.perspCamera.updateProjectionMatrix();
 
-        this.orthoCamera.left = -this.orthoHalfH * aspect;
-        this.orthoCamera.right = this.orthoHalfH * aspect;
-        this.orthoCamera.top = this.orthoHalfH;
-        this.orthoCamera.bottom = -this.orthoHalfH;
+        const vpHalfH = this.orthoHalfH * heightScale;
+        this.orthoCamera.left = -vpHalfH * viewAspect;
+        this.orthoCamera.right = vpHalfH * viewAspect;
+        this.orthoCamera.top = vpHalfH;
+        this.orthoCamera.bottom = -vpHalfH;
         this.orthoCamera.updateProjectionMatrix();
 
+        this.updateResolutionGateOverlay(gate, showGate);
         this.updateReadout();
     }
 
@@ -2202,31 +2453,47 @@ export class FaceViewport {
         this.lastTickMs = nowMs;
 
         if (this.turntablePlaying) {
-            const fps = 24;
-            this.turntableCursor = (this.turntableCursor + dt * fps) % this.turntableFrames;
-            const t = this.turntableFrames > 1
-                ? this.turntableCursor / (this.turntableFrames - 1)
-                : 0.5;
+            const fps = this.clipFps || 24;
+            const plan = this.getExportPlan();
+            const total = Math.max(1, plan.frames > 1 ? plan.frames : (this.frameCount > 0 ? this.frameCount : 24));
+            this.turntableCursor = (this.turntableCursor + dt * fps) % total;
+            const t = total > 1 ? this.turntableCursor / (total - 1) : 0.5;
             const startDeg = Number(this.renderState.startAngle ?? -90);
             const endDeg = Number(this.renderState.endAngle ?? 90);
             const yawDeg = startDeg + (endDeg - startDeg) * t;
             const yawRad = THREE.MathUtils.degToRad(yawDeg);
+            const frameIdx = Math.floor(this.turntableCursor);
+
             if (this.reconstructedFace.hasMesh) {
-                this.reconstructedFace.setTurntableYaw(yawRad);
+                if (plan.motionMode === "clip" && this.recordedClip.length > 0) {
+                    const mf = this.recordedClip[Math.min(this.recordedClip.length - 1, plan.startIdx + frameIdx)];
+                    this.reconstructedFace.applyMotionFrame(mf);
+                    this.reconstructedFace.setTurntableYaw(yawRad, this.renderState.lockHeadPose ? null : mf?.quat);
+                } else if (plan.motionMode === "snap" && this.snapshotPose?.motionFrame) {
+                    this.reconstructedFace.applyMotionFrame(this.snapshotPose.motionFrame);
+                    this.reconstructedFace.setTurntableYaw(
+                        yawRad,
+                        this.renderState.lockHeadPose ? null : this.snapshotPose.motionFrame.quat
+                    );
+                } else {
+                    this.reconstructedFace.setTurntableYaw(yawRad);
+                }
             }
-            const frameIdx = Math.floor(this.turntableCursor) + 1;
-            this.ui.renderPanel.renderStatus.textContent = `Turntable F${frameIdx}/${this.turntableFrames} (${Math.round(yawDeg)}°)`;
+            this.ui.renderPanel.renderStatus.textContent = `Turntable F${frameIdx + 1}/${total} (${Math.round(yawDeg)}°)`;
             this.ui.renderPanel.renderStatus.style.color = "#38bdf8";
             return;
         }
 
         if (this.clipPlaying && this.recordedClip.length > 0 && this.reconstructedFace.hasMesh) {
-            const fps = 24;
+            const fps = this.clipFps || 24;
             this.clipCursor = (this.clipCursor + dt * fps) % this.recordedClip.length;
             const idx = Math.floor(this.clipCursor);
             this.reconstructedFace.applyMotionFrame(this.recordedClip[idx]);
-            this.ui.mocapPanel.motionStatus.textContent = `F${idx + 1}/${this.recordedClip.length}`;
-            this.ui.mocapPanel.motionStatus.style.color = "#38bdf8";
+            const mp = this.ui.mocapPanel;
+            mp.clipScrubber.value = String(idx);
+            mp.clipFrameLabel.textContent = `${idx + 1}/${this.recordedClip.length}`;
+            mp.motionStatus.textContent = `F${idx + 1}/${this.recordedClip.length} @ ${fps}fps`;
+            mp.motionStatus.style.color = "#38bdf8";
             return;
         }
 
@@ -2244,6 +2511,7 @@ export class FaceViewport {
                         this.lastWebcamFrame = frame;
                         this.reconstructedFace.applyMotionFrame(frame);
                         if (this.isRecording && this.recordedClip.length < MAX_RECORDED_FRAMES) {
+                            frame._rawDet = det;
                             this.recordedClip.push(frame);
                             this.ui.mocapPanel.motionStatus.textContent = `REC ${this.recordedClip.length}f`;
                         }
@@ -2279,6 +2547,7 @@ export class FaceViewport {
         this.loadToken++;
         this.reconstructToken++;
         this.bakeToken++;
+        this.videoLoadToken++;
         this.lastBakeResult = null;
         if (this.regRebuildTimer !== null) {
             clearTimeout(this.regRebuildTimer);

@@ -1,17 +1,19 @@
 import * as THREE from "../lib/three.module.js";
 import { api } from "../../../../scripts/api.js";
 
-function buildOffscreenCamera(liveCamera, target, renderState, width, height, keepLivePose) {
+function buildOffscreenCamera(liveCamera, target, renderState, width, height, keepLivePose, orthoHalfH = null, renderFov = null) {
     const outAspect = width / Math.max(height, 1);
     const dist = Math.max(liveCamera.position.distanceTo(target), 0.3);
+    const outFov = Number(renderFov ?? renderState.fov ?? 36);
 
     let offCam;
     if (renderState.projection === "ortho") {
         let halfH;
         if (liveCamera.isOrthographicCamera) {
-            halfH = ((liveCamera.top - liveCamera.bottom) * 0.5) / Math.max(liveCamera.zoom, 1e-4);
+            const baseHalfH = Number.isFinite(orthoHalfH) ? orthoHalfH : ((liveCamera.top - liveCamera.bottom) * 0.5);
+            halfH = baseHalfH / Math.max(liveCamera.zoom, 1e-4);
         } else {
-            halfH = dist * Math.tan(THREE.MathUtils.degToRad(liveCamera.fov || 36) * 0.5);
+            halfH = dist * Math.tan(THREE.MathUtils.degToRad(outFov * 0.5));
         }
         offCam = new THREE.OrthographicCamera(
             -halfH * outAspect,
@@ -22,7 +24,7 @@ function buildOffscreenCamera(liveCamera, target, renderState, width, height, ke
             50.0
         );
     } else {
-        offCam = new THREE.PerspectiveCamera(renderState.fov || 36, outAspect, 0.05, 50.0);
+        offCam = new THREE.PerspectiveCamera(outFov, outAspect, 0.05, 50.0);
     }
 
     if (keepLivePose) {
@@ -86,9 +88,13 @@ export async function renderAndUploadPasses({
     reconstructedFace,
     placeholderHead,
     motionClip,
+    clipFps = 24,
     snapshotFrame = null,
-    turntableFrames,
+    frameCount = 24,
+    turntableFrames = null,
     renderState,
+    orthoHalfH = null,
+    renderFov = null,
     width,
     height,
     onProgress,
@@ -99,23 +105,48 @@ export async function renderAndUploadPasses({
     const frameStride = nPx * 14; // depth(1) + normal(3) + shaded(3) + textured(3) + mask(1) + pose(3)
     const framesPerChunk = Math.max(1, Math.min(4, Math.floor((12 * 1024 * 1024) / frameStride)));
 
-    const exportMode = renderState.exportMode || "turntable";
+    let motionMode = renderState.motionMode;
+    let spinMode = renderState.spinMode;
+    if (!motionMode || !spinMode) {
+        const legacy = renderState.exportMode || "turntable";
+        if (legacy === "clip") {
+            motionMode = "clip";
+            spinMode = "static";
+        } else if (legacy === "single") {
+            motionMode = snapshotFrame ? "snap" : "rest";
+            spinMode = "single";
+        } else {
+            motionMode = snapshotFrame ? "snap" : "rest";
+            spinMode = "turntable";
+        }
+    }
+
     const hasClip = Array.isArray(motionClip) && motionClip.length > 0 && reconstructedFace.hasMesh;
-    if (exportMode === "clip" && !hasClip) {
+    if (motionMode === "clip" && !hasClip) {
         throw new Error(
-            "Export Mode is 'Clip', but no webcam recording or driving_video is loaded. Switch to Turntable or Single."
+            "Motion is set to 'Clip', but no webcam recording or video is loaded. Switch Motion to Rest/Snap or load a clip."
         );
     }
-    const useClip = exportMode === "clip";
-    const isSingle = exportMode === "single";
-    const keepLivePose = useClip || isSingle;
-    const totalFrames = useClip
-        ? motionClip.length
-        : isSingle
-            ? 1
-            : Math.max(1, Math.floor(turntableFrames));
+    const useClip = motionMode === "clip";
+    const useSnap = motionMode === "snap" && Boolean(snapshotFrame);
+    const isSingle = spinMode === "single";
+    const isTurntable = spinMode === "turntable";
+    const keepLivePose = !isTurntable;
+
+    const reqFrames = Math.max(0, Math.floor(turntableFrames ?? frameCount ?? 24));
+    const startIdx = useClip
+        ? Math.max(0, Math.min(motionClip.length - 1, Math.floor((renderState.clipStart ?? 1) - 1)))
+        : 0;
+    const availClip = useClip ? Math.max(1, motionClip.length - startIdx) : 0;
+    const totalFrames = isSingle
+        ? 1
+        : useClip
+            ? (reqFrames > 0 ? Math.min(reqFrames, availClip) : availClip)
+            : (reqFrames > 0 ? reqFrames : 1);
+
     const startAngle = Number(renderState.startAngle ?? -90);
     const endAngle = Number(renderState.endAngle ?? 90);
+    const lockHeadPose = Boolean(renderState.lockHeadPose);
     const dynamicDepth = renderState.depthMode === "dynamic";
 
     const samples = renderState.antialias === "draft" ? 0 : 4;
@@ -154,7 +185,8 @@ export async function renderAndUploadPasses({
 
     try {
         if (grid) grid.visible = false;
-        const offCam = buildOffscreenCamera(liveCamera, controlsTarget, renderState, w, h, keepLivePose);
+        const outFov = Number(renderFov ?? renderState.fov ?? 36);
+        const offCam = buildOffscreenCamera(liveCamera, controlsTarget, renderState, w, h, keepLivePose, orthoHalfH, outFov);
         const activeMesh = reconstructedFace.hasMesh ? reconstructedFace : null;
 
         reconstructedFace.applyRenderState({ ...renderState, poseOverlay: false });
@@ -162,10 +194,16 @@ export async function renderAndUploadPasses({
         // Precompute static pose & Fixed depth range ONCE before the loop (eliminates redundant per-angle skinning/subdiv)
         let fixedDepthBounds = { near: 0.5, far: 3.0 };
         if (activeMesh && !useClip && !isSingle) {
-            if (snapshotFrame) {
+            if (useSnap) {
                 reconstructedFace.applyMotionFrame(snapshotFrame);
             } else {
                 reconstructedFace.resetPose();
+            }
+        } else if (activeMesh && isSingle) {
+            if (useClip) {
+                reconstructedFace.applyMotionFrame(motionClip[startIdx]);
+            } else if (useSnap) {
+                reconstructedFace.applyMotionFrame(snapshotFrame);
             }
         }
         if (activeMesh && !dynamicDepth) {
@@ -181,18 +219,26 @@ export async function renderAndUploadPasses({
 
         for (let f = 0; f < totalFrames; f++) {
             const t = totalFrames > 1 ? f / (totalFrames - 1) : 0.5;
-            const yawDeg = useClip
-                ? 0
+            const yawDeg = isTurntable
+                ? startAngle + (endAngle - startAngle) * t
                 : isSingle
                     ? THREE.MathUtils.radToDeg(activeMesh ? prevRot.y : (prevPhRot?.y || 0))
-                    : startAngle + (endAngle - startAngle) * t;
+                    : 0;
             frameAngles.push(Number(yawDeg.toFixed(2)));
 
             if (activeMesh) {
-                if (useClip) {
-                    reconstructedFace.applyMotionFrame(motionClip[f]);
-                } else if (!isSingle) {
-                    reconstructedFace.setTurntableYaw(THREE.MathUtils.degToRad(yawDeg));
+                if (useClip && !isSingle) {
+                    const mf = motionClip[startIdx + f];
+                    reconstructedFace.applyMotionFrame(mf);
+                    if (isTurntable) {
+                        reconstructedFace.setTurntableYaw(
+                            THREE.MathUtils.degToRad(yawDeg),
+                            lockHeadPose ? null : mf?.quat
+                        );
+                    }
+                } else if (isTurntable) {
+                    const baseQuat = (!lockHeadPose && useSnap) ? snapshotFrame?.quat : null;
+                    reconstructedFace.setTurntableYaw(THREE.MathUtils.degToRad(yawDeg), baseQuat);
                 }
                 if (dynamicDepth) {
                     const b = reconstructedFace.updateDepthBounds(offCam, true);
@@ -295,15 +341,16 @@ export async function renderAndUploadPasses({
             depthRangeLog.far = fixedDepthBounds.far;
         }
 
-        const motionSource = useClip
-            ? "mocap_clip"
-            : snapshotFrame
-                ? (isSingle ? "snapshot_single" : "snapshot_turntable")
-                : (isSingle ? "single_frame" : "turntable");
+        const motionSource = `${motionMode}_${spinMode}`;
 
         const metadata = {
-            export_mode: exportMode,
+            motion_mode: motionMode,
+            spin_mode: spinMode,
+            clip_start_frame: useClip ? startIdx + 1 : null,
+            lock_head_pose: lockHeadPose,
             projection: renderState.projection,
+            fov_deg: outFov,
+            fps: Number(clipFps || 24),
             resolution: [w, h],
             frame_count: totalFrames,
             motion_source: motionSource,

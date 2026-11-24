@@ -1,8 +1,12 @@
 import { stopViewportEvents } from "./ui_icons.js";
 
 export const DEFAULT_RENDER_STATE = {
-    exportMode: "turntable",
+    motionMode: "rest",
+    spinMode: "turntable",
+    clipStart: 1,
+    lockHeadPose: false,
     projection: "ortho",
+    showGate: true,
     fov: 36,
     elevation: 0,
     fitMargin: 0.12,
@@ -189,12 +193,52 @@ export function createRenderPanel(onChange, onFitHead) {
     };
 
     // --- Queue Export Mode ---
-    addSection("Queue Export Mode");
-    addSegmented(null, "exportMode", [
-        { label: "Turntable", value: "turntable", title: "Export turntable_frames rotating from Start Deg to End Deg" },
-        { label: "Clip", value: "clip", title: "Export active driving_video or recorded webcam clip" },
-        { label: "Single", value: "single", title: "Export 1 frame using exact live viewport camera & pose" },
+    addSection("Queue Export");
+    addSegmented("Motion", "motionMode", [
+        { label: "Rest", value: "rest", title: "Neutral sculpted rest pose" },
+        { label: "Snap", value: "snap", title: "Use saved expression snapshot" },
+        { label: "Clip", value: "clip", title: "Play recorded webcam or loaded video clip" },
     ]);
+    addSegmented("Camera", "spinMode", [
+        { label: "Single 1f", value: "single", title: "Export 1 frame using exact live viewport camera & pose" },
+        { label: "Static", value: "static", title: "Render frame_count frames from live camera without spinning" },
+        { label: "Turntable", value: "turntable", title: "Rotate from Start Deg to End Deg over rendered frames" },
+    ]);
+
+    const clipStartRow = document.createElement("div");
+    Object.assign(clipStartRow.style, { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "6px" });
+    const clipStartLbl = document.createElement("span");
+    clipStartLbl.textContent = "Clip Start F";
+    const clipStartInput = document.createElement("input");
+    clipStartInput.type = "number";
+    clipStartInput.min = "1";
+    clipStartInput.max = "600";
+    clipStartInput.step = "1";
+    clipStartInput.value = String(state.clipStart);
+    Object.assign(clipStartInput.style, {
+        width: "64px",
+        fontSize: "10px",
+        fontFamily: "ui-monospace, monospace",
+        color: "#f8fafc",
+        backgroundColor: "rgba(15, 23, 42, 0.85)",
+        border: "1px solid rgba(255, 255, 255, 0.16)",
+        borderRadius: "4px",
+        padding: "2px 6px",
+    });
+    stopViewportEvents(clipStartInput);
+    clipStartInput.addEventListener("input", () => {
+        const val = Math.max(1, Math.min(600, Math.floor(Number(clipStartInput.value) || 1)));
+        state.clipStart = val;
+        onChange?.({ ...state }, "clipStart");
+    });
+    const syncClipStartVisibility = () => {
+        clipStartInput.value = String(Math.max(1, Math.floor(Number(state.clipStart) || 1)));
+        clipStartRow.style.display = state.motionMode === "clip" ? "flex" : "none";
+    };
+    syncClipStartVisibility();
+    setters.push(syncClipStartVisibility);
+    clipStartRow.append(clipStartLbl, clipStartInput);
+    panel.appendChild(clipStartRow);
 
     // --- Camera ---
     addSection("Camera & Geometry");
@@ -224,11 +268,13 @@ export function createRenderPanel(onChange, onFitHead) {
     });
     camBtnRow.append(fitHeadBtn, guidesBtn);
     panel.appendChild(camBtnRow);
+    addToggleRow([{ label: "Res Gate", key: "showGate" }]);
 
     // --- Turntable ---
     addSection("Turntable Preview & Export");
     addSlider("Start Deg", "startAngle", -180, 180, 5, "°");
     addSlider("End Deg", "endAngle", -180, 360, 5, "°");
+    addToggleRow([{ label: "Lock Head Pose", key: "lockHeadPose" }]);
     const turntableBtn = makeRenderButton("Play Turntable", "Play/pause turntable sweep between Start and End angles");
     turntableBtn.style.width = "100%";
     panel.appendChild(turntableBtn);

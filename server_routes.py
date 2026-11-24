@@ -13,22 +13,10 @@ from .face_math import reconstruct_face_mesh
 from .uv_baker import bake_uv_texture
 
 _REGISTERED_EXTENSIONS: set[str] = set()
-_DRIVING_BATCH_CACHE: dict[str, list[str]] = {}
-_MAX_CACHED_BATCHES = 2
 
 _RENDER_JOBS_LOCK = threading.Lock()
 _RENDER_JOBS: dict[str, dict] = {}
 _MAX_RENDER_JOBS = 8
-
-
-def cache_driving_batch(frames: list[str]) -> str:
-    """Store encoded driving video frames in memory and return a short batch ID."""
-    if len(_DRIVING_BATCH_CACHE) >= _MAX_CACHED_BATCHES:
-        oldest_key = next(iter(_DRIVING_BATCH_CACHE))
-        _DRIVING_BATCH_CACHE.pop(oldest_key, None)
-    batch_id = uuid.uuid4().hex[:12]
-    _DRIVING_BATCH_CACHE[batch_id] = frames
-    return batch_id
 
 
 def create_render_job(width: int, height: int) -> tuple[str, dict]:
@@ -215,14 +203,6 @@ def register_static_routes(package_dir: Path) -> None:
             return web.json_response({"error": str(exc)}, status=400)
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
-
-    @prompt_server.routes.get("/yedp_face3d/driving_batch/{batch_id}")
-    async def handle_get_driving_batch(request: web.Request) -> web.Response:
-        batch_id = request.match_info.get("batch_id", "")
-        frames = _DRIVING_BATCH_CACHE.get(batch_id)
-        if frames is None:
-            return web.json_response({"error": "Driving batch not found or expired."}, status=404)
-        return web.json_response({"batch_id": batch_id, "frames": frames})
 
     @prompt_server.routes.post("/yedp_face3d/render_chunk/{job_id}")
     async def handle_render_chunk(request: web.Request) -> web.Response:
