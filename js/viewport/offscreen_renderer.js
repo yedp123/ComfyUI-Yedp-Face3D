@@ -87,6 +87,8 @@ export async function renderAndUploadPasses({
     grid,
     reconstructedFace,
     placeholderHead,
+    teethRig = null,
+    teethEnabled = false,
     motionClip,
     clipFps = 24,
     snapshotFrame = null,
@@ -173,6 +175,9 @@ export async function renderAndUploadPasses({
     const prevLastMotion = reconstructedFace.lastMotionFrame;
     const prevPhVis = placeholderHead?.group?.visible ?? false;
     const prevPhRot = placeholderHead?.group?.rotation?.clone();
+    const prevTeethVis = teethRig ? teethRig.group.visible : false;
+    const prevTmjVis = teethRig?.tmjGroup ? teethRig.tmjGroup.visible : false;
+    const prevTeethWire = teethRig?.enamelMat ? teethRig.enamelMat.wireframe : false;
 
     const readBuf = new Uint8Array(nPx * 4);
     const chunkBuf = new Uint8Array(16 + framesPerChunk * frameStride);
@@ -185,6 +190,12 @@ export async function renderAndUploadPasses({
 
     try {
         if (grid) grid.visible = false;
+        if (teethRig) {
+            teethRig.group.visible = false;
+            if (teethRig.tmjGroup) teethRig.tmjGroup.visible = false;
+            if (teethRig.enamelMat) teethRig.enamelMat.wireframe = false;
+            if (teethRig.gumMat) teethRig.gumMat.wireframe = false;
+        }
         const outFov = Number(renderFov ?? renderState.fov ?? 36);
         const offCam = buildOffscreenCamera(liveCamera, controlsTarget, renderState, w, h, keepLivePose, orthoHalfH, outFov);
         const activeMesh = reconstructedFace.hasMesh ? reconstructedFace : null;
@@ -264,8 +275,18 @@ export async function renderAndUploadPasses({
             const maskOff = baseOff + nPx * 10;
             const poseOff = baseOff + nPx * 11;
 
+            const showTeethPasses = Boolean(teethRig && teethEnabled && activeMesh);
+            if (showTeethPasses) {
+                teethRig.fitToRestMesh(reconstructedFace.restPositions);
+                teethRig.updatePose(reconstructedFace.latestActivePositions, reconstructedFace.lastMotionFrame);
+            }
+
             // 1. Depth Pass (unfiltered, background = 0)
             reconstructedFace.setViewMode("depth");
+            if (showTeethPasses) {
+                teethRig.group.visible = true;
+                teethRig.syncFromFaceMaterial(reconstructedFace.material);
+            }
             renderer.setRenderTarget(rtSharp);
             renderer.setClearColor(0x000000, 0.0);
             renderer.clear();
@@ -275,6 +296,9 @@ export async function renderAndUploadPasses({
 
             // 2. Normal Pass (unfiltered camera-space geometry normals)
             reconstructedFace.setViewMode("normals");
+            if (showTeethPasses) {
+                teethRig.syncFromFaceMaterial(reconstructedFace.material);
+            }
             renderer.setRenderTarget(rtSharp);
             renderer.setClearColor(normalBgColor, 0.0);
             renderer.clear();
@@ -284,6 +308,9 @@ export async function renderAndUploadPasses({
 
             // 3. Shaded Clay Pass + Silhouette/Face Mask (Alpha channel)
             reconstructedFace.setViewMode("clay");
+            if (showTeethPasses) {
+                teethRig.syncFromFaceMaterial(reconstructedFace.material);
+            }
             renderer.setRenderTarget(rtSmooth);
             renderer.setClearColor(bgColor, 0.0);
             renderer.clear();
@@ -294,6 +321,9 @@ export async function renderAndUploadPasses({
 
             // 4. Textured Lit Pass
             reconstructedFace.setViewMode("textured");
+            if (showTeethPasses) {
+                teethRig.syncFromFaceMaterial(reconstructedFace.material);
+            }
             renderer.setRenderTarget(rtSmooth);
             renderer.setClearColor(bgColor, 0.0);
             renderer.clear();
@@ -306,6 +336,9 @@ export async function renderAndUploadPasses({
                 placeholderHead.group.visible = false;
             }
             reconstructedFace.setViewMode("pose");
+            if (teethRig) {
+                teethRig.group.visible = false;
+            }
             renderer.setRenderTarget(rtSmooth);
             renderer.setClearColor(0x000000, 0.0);
             renderer.clear();
@@ -400,6 +433,12 @@ export async function renderAndUploadPasses({
         if (placeholderHead?.group) {
             placeholderHead.group.visible = prevPhVis;
             if (prevPhRot) placeholderHead.group.rotation.copy(prevPhRot);
+        }
+        if (teethRig) {
+            teethRig.group.visible = prevTeethVis;
+            if (teethRig.tmjGroup) teethRig.tmjGroup.visible = prevTmjVis;
+            if (teethRig.enamelMat) teethRig.enamelMat.wireframe = prevTeethWire;
+            if (teethRig.gumMat) teethRig.gumMat.wireframe = prevTeethWire;
         }
     }
 }

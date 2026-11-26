@@ -16,6 +16,12 @@ export const DEFAULT_WEIGHT_STATE = {
     enableColorMatch: true,
     enableSeamBlend: true,
     irisMaskScale: 1.08,
+    testTeeth: false,
+    testJawOpen: 0.0,
+    teethUpperZ: 0.0,
+    teethLowerZ: 0.0,
+    teethOffsetY: 0.0,
+    teethWidthScale: 1.0,
 };
 
 /**
@@ -106,7 +112,7 @@ export function createWeightPanel(onChange) {
     addSlider("Max Disp.", "maxDisp", 0.05, 0.50, 0.01);
     addSlider("Symmetry", "symmetry", 0, 1, 0.05);
 
-    const addToggle = (label, key, withDivider = false) => {
+    const addToggle = (label, key, withDivider = false, defaultValue = true) => {
         const row = document.createElement("div");
         Object.assign(row.style, {
             display: "flex",
@@ -135,7 +141,7 @@ export function createWeightPanel(onChange) {
             lineHeight: "1.2",
         });
         const sync = () => {
-            const enabled = state[key] !== false;
+            const enabled = state[key] === undefined ? Boolean(defaultValue) : Boolean(state[key]);
             state[key] = enabled;
             btn.textContent = enabled ? "ON" : "OFF";
             btn.style.background = enabled ? "rgba(16, 185, 129, 0.22)" : "rgba(51, 65, 85, 0.5)";
@@ -145,7 +151,7 @@ export function createWeightPanel(onChange) {
         stopViewportEvents(btn);
         btn.addEventListener("click", (e) => {
             e.stopPropagation();
-            state[key] = state[key] === false;
+            state[key] = !Boolean(state[key]);
             sync();
             onChange({ ...state });
         });
@@ -161,6 +167,24 @@ export function createWeightPanel(onChange) {
     addToggle("Color Match", "enableColorMatch", true);
     addToggle("Seam Blend", "enableSeamBlend", false);
     addSlider("Iris Mask", "irisMaskScale", 0.75, 1.60, 0.02);
+
+    const teethHeader = document.createElement("div");
+    teethHeader.textContent = "3D Teeth";
+    Object.assign(teethHeader.style, {
+        fontWeight: "600",
+        color: "#94a3b8",
+        borderBottom: "1px solid rgba(255,255,255,0.08)",
+        paddingBottom: "2px",
+        marginTop: "4px",
+    });
+    panel.appendChild(teethHeader);
+
+    addToggle("3D Teeth", "testTeeth", false, false);
+    addSlider("Test Jaw Open", "testJawOpen", 0, 1, 0.01);
+    addSlider("Upper Depth", "teethUpperZ", -0.50, 0.50, 0.02);
+    addSlider("Lower Depth", "teethLowerZ", -0.50, 0.50, 0.02);
+    addSlider("Teeth Height", "teethOffsetY", -0.30, 0.30, 0.02);
+    addSlider("Arch Width", "teethWidthScale", 0.70, 1.60, 0.02);
 
     const note = document.createElement("div");
     note.textContent = "Intermediate vertices blend smoothly across mesh edges.";

@@ -49,6 +49,16 @@ function computeVec3MinMax(arr) {
     return { min, max };
 }
 
+function srgbHexToLinearFactor(hex) {
+    const toLin = (c) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+    return [
+        toLin(((hex >> 16) & 255) / 255),
+        toLin(((hex >> 8) & 255) / 255),
+        toLin((hex & 255) / 255),
+        1.0,
+    ];
+}
+
 function computeNormals(positions, indices) {
     const nVerts = Math.floor(positions.length / 3);
     const norms = new Float32Array(nVerts * 3);
@@ -746,6 +756,8 @@ export async function exportFaceGlbBuffer(faceMesh, options = {}) {
         subdiv = "smooth",        // "smooth" | "base"
         pose = "rest",            // "rest" | "current"
         includeEyeballs = true,
+        includeTeeth = false,
+        teethRig = null,
         animMode = "arkit",       // "arkit" | "exact"
         motionClip = [],
         clipFps = 24,
@@ -976,124 +988,346 @@ export async function exportFaceGlbBuffer(faceMesh, options = {}) {
         }
     }
 
-    // 6. Mocap Animation Tracks
-    const animations = [];
-    if (mode === "animation") {
-        const nFrames = motionClip.length;
-        const fps = Math.max(1, Number(clipFps || 24));
-        const times = new Float32Array(nFrames);
-        const rootQuats = new Float32Array(nFrames * 4);
-        for (let f = 0; f < nFrames; f++) {
-            times[f] = f / fps;
-            const q = motionClip[f]?.quat || [0, 0, 0, 1];
-            rootQuats[f * 4] = q[0];
-            rootQuats[f * 4 + 1] = q[1];
-            rootQuats[f * 4 + 2] = q[2];
-            rootQuats[f * 4 + 3] = q[3];
+    // 6. Optional 3D Teeth, Gums, Tongue & Oral Cavity Hierarchy
+    let jawPivotNodeIdx = -1;
+    let tongueNodeIdx = -1;
+    const exportTeeth = Boolean(includeTeeth && teethRig?.rest);
+    const savedTeethState = exportTeeth
+        ? {
+            jawPos: teethRig.jawPivot.position.clone(),
+            jawRot: teethRig.jawPivot.rotation.clone(),
+            tonguePos: teethRig.tongueMesh.position.clone(),
+            bagPos: new Float32Array(teethRig.mouthBagGeo.getAttribute("position").array),
         }
+        : null;
 
-        const timeBv = pushBin(times);
-        const timeAcc = pushAccessor(timeBv, 5126, nFrames, "SCALAR", {
-            min: [times[0]],
-            max: [times[nFrames - 1]],
-        });
-        const quatBv = pushBin(rootQuats);
-        const quatAcc = pushAccessor(quatBv, 5126, nFrames, "VEC4");
+    try {
+        if (exportTeeth) {
+            if (mode === "static" && pose === "current") {
+                teethRig.updatePose(facePos478, faceMesh.lastMotionFrame);
+            } else {
+                teethRig.updatePose(faceMesh.restPositions, null);
+            }
 
-        const samplersAnim = [{ input: timeAcc, interpolation: "LINEAR", output: quatAcc }];
-        const channels = [{ sampler: 0, target: { node: 0, path: "rotation" } }];
+            const pushGeoPrimitive = (geo, matIdx) => {
+                const posArr = new Float32Array(geo.getAttribute("position").array);
+                const idxRaw = geo.getIndex().array;
+                const idxArr = idxRaw instanceof Uint16Array ? new Uint16Array(idxRaw) : new Uint16Array(idxRaw);
+                const normAttr = geo.getAttribute("normal");
+                const normArr = normAttr
+                    ? new Float32Array(normAttr.array)
+                    : computeNormals(posArr, idxArr);
+                const vertCount = Math.floor(posArr.length / 3);
 
-        const nTargets = targetNames.length;
-        const weights = new Float32Array(nFrames * nTargets);
-        const rw = faceMesh.regionWeights || { eyes: 1.0, brows: 1.0, mouth: 1.0, jaw: 0.85, cheeks: 0.42 };
-
-        if (animMode === "arkit") {
-            const scaleForName = (name) => {
-                if (name.startsWith("eye")) return Number(rw.eyes ?? 1.0);
-                if (name.startsWith("brow")) return Number(rw.brows ?? 1.0);
-                if (name.startsWith("jaw")) return Number(rw.jaw ?? 0.85);
-                if (name.startsWith("cheek") || name.startsWith("nose")) return Number(rw.cheeks ?? 0.42);
-                return Number(rw.mouth ?? 1.0);
+                const pBv = pushBin(posArr, 34962);
+                const nBv = pushBin(normArr, 34962);
+                const iBv = pushBin(idxArr, 34963);
+                const attributes = {
+                    POSITION: pushAccessor(pBv, 5126, vertCount, "VEC3", computeVec3MinMax(posArr)),
+                    NORMAL: pushAccessor(nBv, 5126, vertCount, "VEC3"),
+                };
+                const colAttr = geo.getAttribute("color");
+                if (colAttr) {
+                    const cBv = pushBin(new Float32Array(colAttr.array), 34962);
+                    attributes.COLOR_0 = pushAccessor(cBv, 5126, vertCount, "VEC3");
+                }
+                const indicesAcc = pushAccessor(iBv, 5123, idxArr.length, "SCALAR", {
+                    min: [0],
+                    max: [vertCount - 1],
+                });
+                return { attributes, indices: indicesAcc, material: matIdx };
             };
-            for (let f = 0; f < nFrames; f++) {
-                const bs = motionClip[f]?.bs || {};
-                const base = f * nTargets;
-                for (let t = 0; t < nTargets; t++) {
-                    const name = targetNames[t];
-                    weights[base + t] = Math.max(0, Math.min(1.2, (bs[name] || 0) * scaleForName(name)));
-                }
+
+            const enamelMatIdx = materials.length;
+            materials.push({
+                name: "Teeth_Enamel_Mat",
+                pbrMetallicRoughness: {
+                    baseColorFactor: srgbHexToLinearFactor(0xe8e2d5),
+                    metallicFactor: 0.02,
+                    roughnessFactor: 0.28,
+                },
+            });
+            const gumMatIdx = materials.length;
+            materials.push({
+                name: "Teeth_Gum_Mat",
+                pbrMetallicRoughness: {
+                    baseColorFactor: srgbHexToLinearFactor(0xb96b6b),
+                    metallicFactor: 0.0,
+                    roughnessFactor: 0.55,
+                },
+            });
+            const tongueMatIdx = materials.length;
+            materials.push({
+                name: "Tongue_Mat",
+                pbrMetallicRoughness: {
+                    baseColorFactor: srgbHexToLinearFactor(0x8f474b),
+                    metallicFactor: 0.0,
+                    roughnessFactor: 0.60,
+                },
+            });
+            const cavityMatIdx = materials.length;
+            materials.push({
+                name: "Oral_Cavity_Mat",
+                pbrMetallicRoughness: {
+                    baseColorFactor: srgbHexToLinearFactor(0x160a0b),
+                    metallicFactor: 0.0,
+                    roughnessFactor: 0.95,
+                },
+                doubleSided: false,
+            });
+
+            // Teeth_Upper (rigid under Face3D_Root)
+            const upperMeshIdx = meshes.length;
+            meshes.push({
+                name: "Teeth_Upper_Mesh",
+                primitives: [
+                    pushGeoPrimitive(teethRig.upperTeethGeo, enamelMatIdx),
+                    pushGeoPrimitive(teethRig.upperGumGeo, gumMatIdx),
+                ],
+            });
+            const upperNodeIdx = nodes.length;
+            nodes.push({
+                name: "Teeth_Upper",
+                mesh: upperMeshIdx,
+                translation: [teethRig.upperArch.position.x, teethRig.upperArch.position.y, teethRig.upperArch.position.z],
+                scale: [teethRig.upperArch.scale.x, teethRig.upperArch.scale.y, teethRig.upperArch.scale.z],
+            });
+            rootChildren.push(upperNodeIdx);
+
+            // Teeth_Lower + Tongue (children of Jaw_Pivot)
+            const lowerMeshIdx = meshes.length;
+            meshes.push({
+                name: "Teeth_Lower_Mesh",
+                primitives: [
+                    pushGeoPrimitive(teethRig.lowerTeethGeo, enamelMatIdx),
+                    pushGeoPrimitive(teethRig.lowerGumGeo, gumMatIdx),
+                ],
+            });
+            const lowerNodeIdx = nodes.length;
+            nodes.push({
+                name: "Teeth_Lower",
+                mesh: lowerMeshIdx,
+                translation: [teethRig.lowerArch.position.x, teethRig.lowerArch.position.y, teethRig.lowerArch.position.z],
+                scale: [teethRig.lowerArch.scale.x, teethRig.lowerArch.scale.y, teethRig.lowerArch.scale.z],
+            });
+
+            const tongueMeshIdx = meshes.length;
+            meshes.push({
+                name: "Tongue_Mesh",
+                primitives: [pushGeoPrimitive(teethRig.tongueGeo, tongueMatIdx)],
+            });
+            tongueNodeIdx = nodes.length;
+            nodes.push({
+                name: "Tongue",
+                mesh: tongueMeshIdx,
+                translation: [teethRig.tongueMesh.position.x, teethRig.tongueMesh.position.y, teethRig.tongueMesh.position.z],
+                scale: [teethRig.tongueMesh.scale.x, teethRig.tongueMesh.scale.y, teethRig.tongueMesh.scale.z],
+            });
+
+            jawPivotNodeIdx = nodes.length;
+            const jawPivotNode = {
+                name: "Jaw_Pivot",
+                translation: [teethRig.jawPivot.position.x, teethRig.jawPivot.position.y, teethRig.jawPivot.position.z],
+                children: [lowerNodeIdx, tongueNodeIdx],
+            };
+            const jq = teethRig.jawPivot.quaternion;
+            if (Math.abs(jq.x) + Math.abs(jq.y) + Math.abs(jq.z) > 1e-6) {
+                jawPivotNode.rotation = [jq.x, jq.y, jq.z, jq.w];
             }
-        } else {
-            for (let f = 0; f < nFrames; f++) {
-                weights[f * nTargets + f] = 1.0;
-            }
+            nodes.push(jawPivotNode);
+            rootChildren.push(jawPivotNodeIdx);
+
+            // Oral_Cavity (under Face3D_Root)
+            const cavityMeshIdx = meshes.length;
+            meshes.push({
+                name: "Oral_Cavity_Mesh",
+                primitives: [pushGeoPrimitive(teethRig.mouthBagGeo, cavityMatIdx)],
+            });
+            const cavityNodeIdx = nodes.length;
+            nodes.push({
+                name: "Oral_Cavity",
+                mesh: cavityMeshIdx,
+            });
+            rootChildren.push(cavityNodeIdx);
         }
 
-        const weightBv = pushBin(weights);
-        const weightAcc = pushAccessor(weightBv, 5126, nFrames * nTargets, "SCALAR");
-        const wSamplerIdx = samplersAnim.length;
-        samplersAnim.push({ input: timeAcc, interpolation: "LINEAR", output: weightAcc });
-        channels.push({ sampler: wSamplerIdx, target: { node: 1, path: "weights" } });
-
-        // Eye gaze rotation channels when eyeballs are included
-        if (eyeNodeIndices.length === 2 && faceMesh.eyeballRig?.eyes?.length === 2) {
-            const eyeQuatL = new Float32Array(nFrames * 4);
-            const eyeQuatR = new Float32Array(nFrames * 4);
+        // 7. Mocap Animation Tracks
+        const animations = [];
+        if (mode === "animation") {
+            const nFrames = motionClip.length;
+            const fps = Math.max(1, Number(clipFps || 24));
+            const times = new Float32Array(nFrames);
+            const rootQuats = new Float32Array(nFrames * 4);
             for (let f = 0; f < nFrames; f++) {
-                const mf = motionClip[f];
-                const d = mf?.deltas;
-                let gx = 0;
-                let gy = 0;
-                if (d && d.length >= 474 * 3) {
-                    const sgn = mf.mirror ? -1.0 : 1.0;
-                    const gxR = sgn * d[468 * 3] * 1.4;
-                    const gyR = d[468 * 3 + 1] * 1.4;
-                    const gxL = sgn * d[473 * 3] * 1.4;
-                    const gyL = d[473 * 3 + 1] * 1.4;
-                    gx = 0.5 * (gxR + gxL);
-                    gy = 0.5 * (gyR + gyL);
-                }
-                const q = gazeToQuaternion(gx, gy);
-                eyeQuatR.set(q, f * 4);
-                eyeQuatL.set(q, f * 4);
+                times[f] = f / fps;
+                const q = motionClip[f]?.quat || [0, 0, 0, 1];
+                rootQuats[f * 4] = q[0];
+                rootQuats[f * 4 + 1] = q[1];
+                rootQuats[f * 4 + 2] = q[2];
+                rootQuats[f * 4 + 3] = q[3];
             }
-            const rBv = pushBin(eyeQuatR);
-            const rAcc = pushAccessor(rBv, 5126, nFrames, "VEC4");
-            const rSamp = samplersAnim.length;
-            samplersAnim.push({ input: timeAcc, interpolation: "LINEAR", output: rAcc });
-            channels.push({ sampler: rSamp, target: { node: eyeNodeIndices[0], path: "rotation" } });
 
-            const lBv = pushBin(eyeQuatL);
-            const lAcc = pushAccessor(lBv, 5126, nFrames, "VEC4");
-            const lSamp = samplersAnim.length;
-            samplersAnim.push({ input: timeAcc, interpolation: "LINEAR", output: lAcc });
-            channels.push({ sampler: lSamp, target: { node: eyeNodeIndices[1], path: "rotation" } });
+            const timeBv = pushBin(times);
+            const timeAcc = pushAccessor(timeBv, 5126, nFrames, "SCALAR", {
+                min: [times[0]],
+                max: [times[nFrames - 1]],
+            });
+            const quatBv = pushBin(rootQuats);
+            const quatAcc = pushAccessor(quatBv, 5126, nFrames, "VEC4");
+
+            const samplersAnim = [{ input: timeAcc, interpolation: "LINEAR", output: quatAcc }];
+            const channels = [{ sampler: 0, target: { node: 0, path: "rotation" } }];
+
+            const nTargets = targetNames.length;
+            const weights = new Float32Array(nFrames * nTargets);
+            const rw = faceMesh.regionWeights || { eyes: 1.0, brows: 1.0, mouth: 1.0, jaw: 0.85, cheeks: 0.42 };
+
+            if (animMode === "arkit") {
+                const scaleForName = (name) => {
+                    if (name.startsWith("eye")) return Number(rw.eyes ?? 1.0);
+                    if (name.startsWith("brow")) return Number(rw.brows ?? 1.0);
+                    if (name.startsWith("jaw")) return Number(rw.jaw ?? 0.85);
+                    if (name.startsWith("cheek") || name.startsWith("nose")) return Number(rw.cheeks ?? 0.42);
+                    return Number(rw.mouth ?? 1.0);
+                };
+                for (let f = 0; f < nFrames; f++) {
+                    const bs = motionClip[f]?.bs || {};
+                    const base = f * nTargets;
+                    for (let t = 0; t < nTargets; t++) {
+                        const name = targetNames[t];
+                        weights[base + t] = Math.max(0, Math.min(1.2, (bs[name] || 0) * scaleForName(name)));
+                    }
+                }
+            } else {
+                for (let f = 0; f < nFrames; f++) {
+                    weights[f * nTargets + f] = 1.0;
+                }
+            }
+
+            const weightBv = pushBin(weights);
+            const weightAcc = pushAccessor(weightBv, 5126, nFrames * nTargets, "SCALAR");
+            const wSamplerIdx = samplersAnim.length;
+            samplersAnim.push({ input: timeAcc, interpolation: "LINEAR", output: weightAcc });
+            channels.push({ sampler: wSamplerIdx, target: { node: 1, path: "weights" } });
+
+            // Eye gaze rotation channels when eyeballs are included
+            if (eyeNodeIndices.length === 2 && faceMesh.eyeballRig?.eyes?.length === 2) {
+                const eyeQuatL = new Float32Array(nFrames * 4);
+                const eyeQuatR = new Float32Array(nFrames * 4);
+                for (let f = 0; f < nFrames; f++) {
+                    const mf = motionClip[f];
+                    const d = mf?.deltas;
+                    let gx = 0;
+                    let gy = 0;
+                    if (d && d.length >= 474 * 3) {
+                        const sgn = mf.mirror ? -1.0 : 1.0;
+                        const gxR = sgn * d[468 * 3] * 1.4;
+                        const gyR = d[468 * 3 + 1] * 1.4;
+                        const gxL = sgn * d[473 * 3] * 1.4;
+                        const gyL = d[473 * 3 + 1] * 1.4;
+                        gx = 0.5 * (gxR + gxL);
+                        gy = 0.5 * (gyR + gyL);
+                    }
+                    const q = gazeToQuaternion(gx, gy);
+                    eyeQuatR.set(q, f * 4);
+                    eyeQuatL.set(q, f * 4);
+                }
+                const rBv = pushBin(eyeQuatR);
+                const rAcc = pushAccessor(rBv, 5126, nFrames, "VEC4");
+                const rSamp = samplersAnim.length;
+                samplersAnim.push({ input: timeAcc, interpolation: "LINEAR", output: rAcc });
+                channels.push({ sampler: rSamp, target: { node: eyeNodeIndices[0], path: "rotation" } });
+
+                const lBv = pushBin(eyeQuatL);
+                const lAcc = pushAccessor(lBv, 5126, nFrames, "VEC4");
+                const lSamp = samplersAnim.length;
+                samplersAnim.push({ input: timeAcc, interpolation: "LINEAR", output: lAcc });
+                channels.push({ sampler: lSamp, target: { node: eyeNodeIndices[1], path: "rotation" } });
+            }
+
+            // Jaw_Pivot (translation + rotation) & Tongue (translation) tracks when 3D Teeth are included
+            if (exportTeeth && jawPivotNodeIdx >= 0 && tongueNodeIdx >= 0) {
+                const rig = faceMesh.morphRig || new FaceRetargetRig(facePos478, faceMesh.baseIndices, faceMesh.regionWeights);
+                const scratch = new Float32Array(478 * 3);
+                const jawTrans = new Float32Array(nFrames * 3);
+                const jawQuats = new Float32Array(nFrames * 4);
+                const tongueTrans = new Float32Array(nFrames * 3);
+
+                for (let f = 0; f < nFrames; f++) {
+                    rig.evaluate(motionClip[f], scratch);
+                    teethRig.updatePose(scratch, motionClip[f]);
+
+                    const jp = teethRig.jawPivot.position;
+                    jawTrans[f * 3] = jp.x;
+                    jawTrans[f * 3 + 1] = jp.y;
+                    jawTrans[f * 3 + 2] = jp.z;
+
+                    const jq = teethRig.jawPivot.quaternion;
+                    const qLen = Math.hypot(jq.x, jq.y, jq.z, jq.w) || 1.0;
+                    jawQuats[f * 4] = jq.x / qLen;
+                    jawQuats[f * 4 + 1] = jq.y / qLen;
+                    jawQuats[f * 4 + 2] = jq.z / qLen;
+                    jawQuats[f * 4 + 3] = jq.w / qLen;
+
+                    const tp = teethRig.tongueMesh.position;
+                    tongueTrans[f * 3] = tp.x;
+                    tongueTrans[f * 3 + 1] = tp.y;
+                    tongueTrans[f * 3 + 2] = tp.z;
+                }
+
+                const jtBv = pushBin(jawTrans);
+                const jtAcc = pushAccessor(jtBv, 5126, nFrames, "VEC3");
+                const jtSamp = samplersAnim.length;
+                samplersAnim.push({ input: timeAcc, interpolation: "LINEAR", output: jtAcc });
+                channels.push({ sampler: jtSamp, target: { node: jawPivotNodeIdx, path: "translation" } });
+
+                const jqBv = pushBin(jawQuats);
+                const jqAcc = pushAccessor(jqBv, 5126, nFrames, "VEC4");
+                const jqSamp = samplersAnim.length;
+                samplersAnim.push({ input: timeAcc, interpolation: "LINEAR", output: jqAcc });
+                channels.push({ sampler: jqSamp, target: { node: jawPivotNodeIdx, path: "rotation" } });
+
+                const ttBv = pushBin(tongueTrans);
+                const ttAcc = pushAccessor(ttBv, 5126, nFrames, "VEC3");
+                const ttSamp = samplersAnim.length;
+                samplersAnim.push({ input: timeAcc, interpolation: "LINEAR", output: ttAcc });
+                channels.push({ sampler: ttSamp, target: { node: tongueNodeIdx, path: "translation" } });
+            }
+
+            animations.push({
+                name: "Face3D_Mocap",
+                samplers: samplersAnim,
+                channels,
+            });
         }
 
-        animations.push({
-            name: "Face3D_Mocap",
-            samplers: samplersAnim,
-            channels,
-        });
-    }
+        const gltf = {
+            asset: { version: "2.0", generator: "ComfyUI-Yedp-Face3D" },
+            scene: 0,
+            scenes: [{ name: "Scene", nodes: [0] }],
+            nodes,
+            meshes,
+            materials,
+            textures,
+            images,
+            samplers,
+            bufferViews,
+            accessors,
+            buffers: [{ byteLength: binOffset }],
+        };
+        if (animations.length > 0) {
+            gltf.animations = animations;
+        }
 
-    const gltf = {
-        asset: { version: "2.0", generator: "ComfyUI-Yedp-Face3D" },
-        scene: 0,
-        scenes: [{ name: "Scene", nodes: [0] }],
-        nodes,
-        meshes,
-        materials,
-        textures,
-        images,
-        samplers,
-        bufferViews,
-        accessors,
-        buffers: [{ byteLength: binOffset }],
-    };
-    if (animations.length > 0) {
-        gltf.animations = animations;
+        return packGlb(gltf, binParts);
+    } finally {
+        if (savedTeethState && teethRig) {
+            teethRig.jawPivot.position.copy(savedTeethState.jawPos);
+            teethRig.jawPivot.rotation.copy(savedTeethState.jawRot);
+            teethRig.tongueMesh.position.copy(savedTeethState.tonguePos);
+            const bagAttr = teethRig.mouthBagGeo.getAttribute("position");
+            bagAttr.array.set(savedTeethState.bagPos);
+            bagAttr.needsUpdate = true;
+        }
     }
-
-    return packGlb(gltf, binParts);
 }

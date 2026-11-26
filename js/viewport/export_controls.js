@@ -4,6 +4,7 @@ export const DEFAULT_EXPORT_STATE = {
     scope: "head",
     subdiv: "smooth",
     includeEyeballs: true,
+    includeTeeth: false,
     pose: "rest",
     animMode: "arkit",
 };
@@ -125,6 +126,20 @@ export function createExportPanel(handlers = {}) {
     eyeLbl.textContent = "Include Eyeballs";
     eyeRow.append(eyeCb, eyeLbl);
     panel.appendChild(eyeRow);
+
+    const teethRow = document.createElement("label");
+    Object.assign(teethRow.style, { display: "inline-flex", alignItems: "center", gap: "5px", cursor: "pointer" });
+    const teethCb = document.createElement("input");
+    teethCb.type = "checkbox";
+    teethCb.checked = state.includeTeeth;
+    stopViewportEvents(teethCb);
+    teethCb.addEventListener("change", () => {
+        state.includeTeeth = teethCb.checked;
+    });
+    const teethLbl = document.createElement("span");
+    teethLbl.textContent = "Include 3D Teeth";
+    teethRow.append(teethCb, teethLbl);
+    panel.appendChild(teethRow);
 
     // --- 1. Static Mesh ---
     addSection("1. Static Mesh");

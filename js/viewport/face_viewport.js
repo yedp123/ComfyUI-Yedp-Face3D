@@ -2,6 +2,7 @@ import { api } from "../../../../scripts/api.js";
 import * as THREE from "../lib/three.module.js";
 import { OrbitControls } from "../lib/OrbitControls.js";
 import { getCanonicalFaceData, getHeadShellRig, ReconstructedFaceMesh } from "./face_mesh.js";
+import { TeethRig } from "./teeth_rig.js";
 import { renderAndUploadPasses } from "./offscreen_renderer.js";
 import { bakeFaceTexturePngBytes, exportFaceGlbBuffer } from "./glb_exporter.js";
 import { stopViewportEvents } from "./ui_icons.js";
@@ -179,6 +180,9 @@ export class FaceViewport {
         this.reconstructedFace.setSculptState(this.ui.sculptPanel.getState());
         this.reconstructedFace.applyRenderState(this.renderState);
         this.scene.add(this.reconstructedFace.group);
+
+        this.teethRig = new TeethRig();
+        this.reconstructedFace.group.add(this.teethRig.group);
 
         this.ui.refStack.setClearHandler?.((viewKey) => this.clearSingleReference(viewKey));
         this.bindHudEvents();
@@ -848,6 +852,7 @@ export class FaceViewport {
         this.viewMode = mode;
         this.ui.modeBar.setActiveMode(mode);
         this.reconstructedFace?.setViewMode(mode);
+        this.syncTeethRig();
     }
 
     setSmoothEnabled(enabled) {
@@ -915,8 +920,30 @@ export class FaceViewport {
         this.lastIrisMaskScale = Number.isFinite(irisMaskScale) ? irisMaskScale : 1.08;
     }
 
+    syncTeethRig(weightState = this.ui.weightPanel?.getState()) {
+        if (!this.teethRig) return;
+        const wState = weightState || {};
+        const visible = Boolean(
+            wState.testTeeth
+            && this.reconstructedFace?.hasMesh
+            && this.viewMode !== "pose"
+            && !this.isExporting
+        );
+        this.teethRig.group.visible = visible;
+        if (!visible) return;
+        this.teethRig.setViewMode(this.viewMode);
+        this.teethRig.fitToRestMesh(this.reconstructedFace.restPositions);
+        this.teethRig.setSettings(wState);
+        this.teethRig.updatePose(
+            this.reconstructedFace.latestActivePositions,
+            this.reconstructedFace.lastMotionFrame
+        );
+        this.teethRig.syncFromFaceMaterial(this.reconstructedFace.material);
+    }
+
     updateWeights(weightState) {
         if (!weightState) return;
+        this.syncTeethRig(weightState);
         const irisMaskScale = Number(weightState.irisMaskScale ?? 1.08);
         if (Number.isFinite(irisMaskScale) && irisMaskScale !== this.lastIrisMaskScale) {
             this.lastIrisMaskScale = irisMaskScale;
@@ -1671,12 +1698,19 @@ export class FaceViewport {
         }
         try {
             ep?.setStatus("Building GLB...");
+            const includeTeeth = Boolean(opts.includeTeeth);
+            if (includeTeeth && this.teethRig) {
+                this.teethRig.fitToRestMesh(this.reconstructedFace.restPositions);
+                this.teethRig.setSettings(this.ui.weightPanel?.getState());
+            }
             const glbBytes = await exportFaceGlbBuffer(this.reconstructedFace, {
                 mode,
                 scope: opts.scope || "head",
                 subdiv: opts.subdiv || "smooth",
                 pose: opts.pose || "rest",
                 includeEyeballs: opts.includeEyeballs !== false,
+                includeTeeth,
+                teethRig: this.teethRig,
                 animMode: opts.animMode || "arkit",
                 motionClip: this.recordedClip,
                 clipFps: this.clipFps || 24,
@@ -1972,6 +2006,7 @@ export class FaceViewport {
             this.renderState = this.ui.renderPanel.getState();
             this.setStatus(`Rendering ${render_width}x${render_height}...`);
             this.isExporting = true;
+            const teethEnabled = Boolean(this.ui.weightPanel?.getState()?.testTeeth);
             this.reconstructedFace?.setWeightDebugVisible(false);
             this.reconstructedFace?.setUvDebugMode("off");
             try {
@@ -1984,6 +2019,8 @@ export class FaceViewport {
                     grid: this.grid,
                     reconstructedFace: this.reconstructedFace,
                     placeholderHead: null,
+                    teethRig: this.teethRig,
+                    teethEnabled,
                     motionClip: this.recordedClip,
                     clipFps: this.clipFps || 24,
                     snapshotFrame: this.snapshotActive ? this.snapshotPose?.motionFrame : null,
@@ -2000,6 +2037,7 @@ export class FaceViewport {
                 });
             } finally {
                 this.isExporting = false;
+                this.syncTeethRig();
                 this.reconstructedFace?.setWeightDebugVisible(this.weightDebugEnabled);
                 this.reconstructedFace?.setUvDebugMode(this.mvTexEnabled ? this.uvDebugMode : "off");
             }
@@ -2077,6 +2115,7 @@ export class FaceViewport {
         this.updateRefButtonsUI();
         this.updateMotionUI();
         this.updateRenderUI();
+        this.syncTeethRig();
         this.loadDefaultCanonicalHead();
     }
 
@@ -2125,6 +2164,12 @@ export class FaceViewport {
                     enableColorMatch: saved.weights.enableColorMatch !== false,
                     enableSeamBlend: saved.weights.enableSeamBlend !== false,
                     irisMaskScale: saved.weights.irisMaskScale ?? 1.08,
+                    testTeeth: Boolean(saved.weights.testTeeth),
+                    testJawOpen: Number.isFinite(Number(saved.weights.testJawOpen)) ? Number(saved.weights.testJawOpen) : 0.0,
+                    teethUpperZ: Number.isFinite(Number(saved.weights.teethUpperZ)) ? Number(saved.weights.teethUpperZ) : 0.0,
+                    teethLowerZ: Number.isFinite(Number(saved.weights.teethLowerZ)) ? Number(saved.weights.teethLowerZ) : 0.0,
+                    teethOffsetY: Number.isFinite(Number(saved.weights.teethOffsetY)) ? Number(saved.weights.teethOffsetY) : 0.0,
+                    teethWidthScale: Number.isFinite(Number(saved.weights.teethWidthScale)) ? Number(saved.weights.teethWidthScale) : 1.0,
                 },
                 false,
             );
@@ -2535,6 +2580,7 @@ export class FaceViewport {
             if (this.viewMode === "depth" && this.reconstructedFace.hasMesh) {
                 this.reconstructedFace.updateDepthBounds(this.camera, this.renderState.depthMode === "dynamic");
             }
+            this.syncTeethRig();
             this.renderer.render(this.scene, this.camera);
         };
         this.rafId = requestAnimationFrame(tick);
@@ -2562,6 +2608,10 @@ export class FaceViewport {
         if (this.resizeObserver) {
             this.resizeObserver.disconnect();
             this.resizeObserver = null;
+        }
+        if (this.teethRig) {
+            this.teethRig.dispose();
+            this.teethRig = null;
         }
         if (this.reconstructedFace) {
             this.reconstructedFace.dispose();
