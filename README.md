@@ -3,6 +3,9 @@ experimental MediaPipe-based 3D face reconstruction for AI image conditioning
 
 https://github.com/user-attachments/assets/d3a2a307-efe9-4bf0-a9d7-34227edaf585
 
+<img width="872" height="825" alt="45d1b1d66ba28dfcece68e79700e9cd8" src="https://github.com/user-attachments/assets/b8393f3b-e6d8-4cc3-aaf0-548e6545270d" />
+
+
 This is not photogrammetry and doesn't produce a production-ready 3D head. It uses MediaPipe's 478 facial landmarks to create an approximate, controllable 3D representation of a reference face.  
 The original motivation was to explore whether this lightweight geometric representation could provide useful shape guidance for AI image generation through depth, normal and other rendered passes.
 
