@@ -1,7 +1,8 @@
 # ComfyUI-Yedp-Face3D
 experimental MediaPipe-based 3D face reconstruction for AI image conditioning
 
-https://github.com/user-attachments/assets/d3a2a307-efe9-4bf0-a9d7-34227edaf585
+
+https://github.com/user-attachments/assets/c6afc10e-4334-4708-9e84-79d5ad033878
 
 <img width="872" height="825" alt="45d1b1d66ba28dfcece68e79700e9cd8" src="https://github.com/user-attachments/assets/b8393f3b-e6d8-4cc3-aaf0-548e6545270d" />
 
